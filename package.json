@@ -1,0 +1,43 @@
+{
+  "name": "pi-claude-subagent",
+  "version": "0.1.0",
+  "description": "Claude-style delegated subagent tool for Pi.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/trotsky1997/pi-claude-subagent.git"
+  },
+  "homepage": "https://github.com/trotsky1997/pi-claude-subagent",
+  "bugs": {
+    "url": "https://github.com/trotsky1997/pi-claude-subagent/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/claude-subagent"
+    ]
+  },
+  "dependencies": {
+    "pi-claude-plan-mode": "git+https://github.com/trotsky1997/pi-claude-plan-mode.git#main",
+    "pi-claude-runtime-core": "git+https://github.com/trotsky1997/pi-claude-runtime-core.git#main",
+    "pi-claude-todo-v2": "git+https://github.com/trotsky1997/pi-claude-todo-v2.git#main",
+    "zod": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2"
+  },
+  "exports": {
+    "./agents": "./extensions/claude-subagent/agents.ts",
+    "./team-state": "./extensions/claude-subagent/team-state.ts",
+    "./types": "./extensions/claude-subagent/types.ts"
+  }
+}
