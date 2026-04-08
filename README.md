@@ -15,16 +15,22 @@ This package currently has a hybrid architecture:
 
 ## Install
 
+Install into the current project from GitHub:
+
+```bash
+pi install -l git:github.com/trotsky1997/pi-claude-subagent
+```
+
+Install globally into Pi:
+
+```bash
+pi install git:github.com/trotsky1997/pi-claude-subagent
+```
+
 Local install from this workspace:
 
 ```bash
 pi install -l /home/aka/pi-playground/pi-claude-subagent
-```
-
-Install directly from GitHub:
-
-```bash
-pi install -l git:github.com/trotsky1997/pi-claude-subagent
 ```
 
 Quick-load without installing:
