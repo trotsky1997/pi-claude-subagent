@@ -27,9 +27,9 @@
     ]
   },
   "dependencies": {
-    "pi-claude-plan-mode": "git+https://github.com/trotsky1997/pi-claude-plan-mode.git#main",
-    "pi-claude-runtime-core": "git+https://github.com/trotsky1997/pi-claude-runtime-core.git#main",
-    "pi-claude-todo-v2": "git+https://github.com/trotsky1997/pi-claude-todo-v2.git#main",
+    "pi-claude-plan-mode": "https://codeload.github.com/trotsky1997/pi-claude-plan-mode/tar.gz/refs/heads/main",
+    "pi-claude-runtime-core": "https://codeload.github.com/trotsky1997/pi-claude-runtime-core/tar.gz/refs/heads/main",
+    "pi-claude-todo-v2": "https://codeload.github.com/trotsky1997/pi-claude-todo-v2/tar.gz/refs/heads/main",
     "zod": "^4.0.1"
   },
   "devDependencies": {
