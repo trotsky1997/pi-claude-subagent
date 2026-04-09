@@ -73,7 +73,7 @@ Supported now:
 - agent frontmatter `initialPrompt`
 - agent frontmatter `maxTurns`
 - agent frontmatter `memory` (`user`, `project`, or `local`)
-- agent frontmatter `isolation` metadata (`worktree` / `remote`) for future backend support
+- agent frontmatter `isolation`, with `worktree` now supported for named agents and teammates and `remote` still reserved for future backend support
 - `SendMessage` follow-ups for named agents
 - `team_name + name` for local in-process teammate spawns
 - `TeamCreate` + `SendMessage to "*"` for local team broadcast routing
@@ -164,6 +164,7 @@ Managed runtime state is stored under the project:
 - `.pi/claude-subagent/teams/` - local team files and teammate membership/state
 - `.pi/claude-subagent/active-team.json` - current active local team context
 - `.pi/claude-subagent/agent-memory/` and `.pi/claude-subagent/agent-memory-local/` - project/local persistent agent memory roots when agents opt into memory
+- sibling `../.pi-claude-subagent-worktrees/<repo-hash>/<runtime>/` directories - retained git worktrees for named runtimes using `isolation: worktree`
 
 This gives local Claude-style continuation and teammate coordination without depending on a single long-lived parent process. Live background execution still depends on the current Pi process because it is runtime-backed rather than subprocess-detached.
 
@@ -194,6 +195,6 @@ Bundled/user/project agent frontmatter can also declare:
 - `maxTurns`
 - `memory`
 
-Current limitations: `bash` is blocked when `allowed_directories` is set, because this package does not yet have Claude Code's full shell path-permission engine. Agent `isolation` metadata is parsed and persisted, but launch currently fails clearly because isolated runtimes are not implemented yet.
+Current limitations: `allowed_directories` still only constrains file-oriented tools. `bash` is now allowed even when directory restrictions are set, so shell commands are not path-confined yet and can still escape those directory boundaries. `isolation: worktree` currently requires `name`, creates a retained sibling git worktree outside the main checkout, and keeps successful worktrees on disk for manual review/merge. `isolation: remote` is still not implemented.
 
 Project-local agents are repo-controlled prompts. When the selected agent comes from the nearest `.pi/agents` directory and Pi has an interactive UI, the package asks for confirmation before running it.

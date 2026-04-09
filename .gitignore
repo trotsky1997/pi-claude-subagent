@@ -2,3 +2,4 @@ node_modules/
 package-lock.json
 .pi/
 .sessions/
+ai-slop-report.json

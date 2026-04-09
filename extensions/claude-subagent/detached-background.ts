@@ -84,12 +84,12 @@ function resolveCurrentModelLabel(currentModel: string | undefined, modelOverrid
 }
 
 async function ensurePersistentSession(options: {
-  cwd: string;
+  runtimeCwd: string;
   sessionDir: string;
   existingSessionFile?: string;
 }): Promise<{ sessionFile: string; sessionId: string }> {
   if (options.existingSessionFile && fs.existsSync(options.existingSessionFile)) {
-    const sessionManager = SessionManager.open(options.existingSessionFile, options.sessionDir, options.cwd);
+    const sessionManager = SessionManager.open(options.existingSessionFile, options.sessionDir, options.runtimeCwd);
     const sessionFile = sessionManager.getSessionFile();
     if (!sessionFile) {
       throw new Error(`Persisted session is missing a session file: ${options.existingSessionFile}`);
@@ -97,7 +97,7 @@ async function ensurePersistentSession(options: {
     return { sessionFile, sessionId: sessionManager.getSessionId() };
   }
 
-  const sessionManager = SessionManager.create(options.cwd, options.sessionDir);
+  const sessionManager = SessionManager.create(options.runtimeCwd, options.sessionDir);
   const sessionFile = sessionManager.getSessionFile();
   if (!sessionFile) {
     throw new Error("Failed to create a persistent session file for detached background execution.");
@@ -117,7 +117,8 @@ export function supportsDetachedBackgroundRun(options: {
 }
 
 export async function launchDetachedBackgroundRun(options: {
-  cwd: string;
+  stateCwd: string;
+  runtimeCwd?: string;
   getSessionDir: (cwd: string) => string;
   name: string;
   kind?: ManagedRuntimeKind;
@@ -133,28 +134,31 @@ export async function launchDetachedBackgroundRun(options: {
   managedTaskRegistry?: ManagedTaskRegistry | null;
 }): Promise<NamedAgentRecord> {
   const kind = options.kind ?? "subagent";
+  const stateCwd = options.stateCwd;
+  const runtimeCwd = options.persisted?.cwd ?? options.runtimeCwd ?? stateCwd;
   const runtimeKey = getRuntimeKey({ name: options.name, kind, teamName: options.teamName });
-  const runtimeDir = getDetachedRuntimeDir(options.cwd, runtimeKey);
+  const runtimeDir = getDetachedRuntimeDir(stateCwd, runtimeKey);
   await fs.promises.mkdir(runtimeDir, { recursive: true });
-  const sessionDir = options.getSessionDir(options.cwd);
+  const sessionDir = options.getSessionDir(stateCwd);
   const { sessionFile, sessionId } = await ensurePersistentSession({
-    cwd: options.cwd,
+    runtimeCwd,
     sessionDir,
     existingSessionFile: options.persisted?.sessionFile,
   });
 
   const taskId = runtimeKey;
-  const inboxFile = getDetachedInboxFile(options.cwd, runtimeKey);
-  const outboxFile = getDetachedOutboxFile(options.cwd, runtimeKey);
-  const outboxCursorFile = getDetachedOutboxCursorFile(options.cwd, runtimeKey);
-  const payloadFile = getDetachedPayloadFile(options.cwd, runtimeKey);
+  const inboxFile = getDetachedInboxFile(stateCwd, runtimeKey);
+  const outboxFile = getDetachedOutboxFile(stateCwd, runtimeKey);
+  const outboxCursorFile = getDetachedOutboxCursorFile(stateCwd, runtimeKey);
+  const payloadFile = getDetachedPayloadFile(stateCwd, runtimeKey);
   const payload: DetachedBackgroundPayload = DetachedBackgroundPayloadSchema.parse({
     runtimeKey,
     taskId,
     inboxFile,
     outboxFile,
     outboxCursorFile,
-    cwd: options.cwd,
+    stateCwd,
+    runtimeCwd,
     name: options.name,
     kind,
     teamName: options.teamName,
@@ -181,7 +185,7 @@ export async function launchDetachedBackgroundRun(options: {
   const nodePath = buildDetachedNodePath();
 
   const detachedProcess = spawn("bun", [detachedRunnerPath, payloadFile], {
-    cwd: options.cwd,
+    cwd: stateCwd,
     detached: true,
     stdio: "ignore",
     env: {
@@ -194,7 +198,7 @@ export async function launchDetachedBackgroundRun(options: {
   const record: NamedAgentRecord = {
     name: options.name,
     agentType: options.agent.name,
-    cwd: options.cwd,
+    cwd: runtimeCwd,
     sessionFile,
     kind,
     ...(options.teamName ? { teamName: options.teamName } : {}),
@@ -218,7 +222,7 @@ export async function launchDetachedBackgroundRun(options: {
     lastStartedAt: new Date().toISOString(),
   };
 
-  await upsertNamedAgentRecordOnDisk(options.cwd, record);
+  await upsertNamedAgentRecordOnDisk(stateCwd, record);
   if (options.managedTaskRegistry) {
     await options.managedTaskRegistry.upsertFromRecord({
       ...record,

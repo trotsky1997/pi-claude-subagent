@@ -21,11 +21,27 @@ import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { defineTool, type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type ToolDefinition, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
+import {
+	defineTool,
+	type ExtensionAPI,
+	type ExtensionContext,
+	getMarkdownTheme,
+	type ToolDefinition,
+	withFileMutationQueue,
+} from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { type AgentConfig, type AgentScope } from "pi-claude-runtime-core/agent-discovery";
-import type { ActiveTeamState, BackgroundAgentNotification, NamedAgentRecord, NamedAgentState, TeamMemberRecord } from "pi-claude-runtime-core/managed-runtime-schemas";
+import {
+	type AgentConfig,
+	type AgentScope,
+} from "pi-claude-runtime-core/agent-discovery";
+import type {
+	ActiveTeamState,
+	BackgroundAgentNotification,
+	NamedAgentRecord,
+	NamedAgentState,
+	TeamMemberRecord,
+} from "pi-claude-runtime-core/managed-runtime-schemas";
 import {
 	AGENT_PERMISSION_MODES,
 	parseAgentPermissionMode,
@@ -34,16 +50,53 @@ import {
 	sanitizeNamedAgentState,
 } from "pi-claude-runtime-core/managed-runtime-schemas";
 import { ManagedTaskRegistry } from "pi-claude-runtime-core/managed-task-registry";
-import { getSharedClaudeTodoBridge, setSharedAgentRuntimeManager, setSharedChildRuntimeToolBuilder, setSharedManagedRuntimeCoordinator, setSharedManagedTaskRegistry, type ChildRuntimeToolContext, type ManagedRuntimeCoordinatorLike } from "pi-claude-runtime-core/runtime-bridge";
-import { loadTeamRecord, saveTeamRecord, createTeamRecord, deleteTeamRecord, loadActiveTeamState, removeTeamMember, saveActiveTeamState, upsertTeamMember, getTeamsDir } from "pi-claude-runtime-core/team-state";
+import {
+	getSharedClaudeTodoBridge,
+	setSharedAgentRuntimeManager,
+	setSharedChildRuntimeToolBuilder,
+	setSharedManagedRuntimeCoordinator,
+	setSharedManagedTaskRegistry,
+	type ChildRuntimeToolContext,
+	type ManagedRuntimeCoordinatorLike,
+} from "pi-claude-runtime-core/runtime-bridge";
+import {
+	loadTeamRecord,
+	saveTeamRecord,
+	createTeamRecord,
+	deleteTeamRecord,
+	loadActiveTeamState,
+	removeTeamMember,
+	saveActiveTeamState,
+	upsertTeamMember,
+	getTeamsDir,
+} from "pi-claude-runtime-core/team-state";
 import { AgentRuntimeManager } from "./agent-runtime-manager.js";
 import { discoverAgents } from "./agents.js";
-import { createPermissionExtensionFactory, filterCustomTools, mergePermissionConfig, resolveAllowedDirectories, resolveAllowedToolNames } from "./agent-permissions.js";
+import {
+	createPermissionExtensionFactory,
+	filterCustomTools,
+	mergePermissionConfig,
+	resolveAllowedDirectories,
+	resolveAllowedToolNames,
+	type AgentPermissionConfig,
+} from "./agent-permissions.js";
 import { getAgentMemoryDir } from "./agent-memory.js";
-import { consumeDetachedOutboxEvents, getRuntimeKey, launchDetachedBackgroundRun, queueDetachedBackgroundMessage, requestDetachedBackgroundShutdown, supportsDetachedBackgroundRun } from "./detached-background.js";
-import { loadNamedAgentStateFromDisk as loadNamedAgentStateFromDiskFile, markRunningAgentsInterrupted as markNamedAgentStateInterrupted, saveNamedAgentStateToDisk as saveNamedAgentStateToDiskFile } from "./named-agent-state.js";
+import {
+	consumeDetachedOutboxEvents,
+	getRuntimeKey,
+	launchDetachedBackgroundRun,
+	queueDetachedBackgroundMessage,
+	requestDetachedBackgroundShutdown,
+	supportsDetachedBackgroundRun,
+} from "./detached-background.js";
+import {
+	loadNamedAgentStateFromDisk as loadNamedAgentStateFromDiskFile,
+	markRunningAgentsInterrupted as markNamedAgentStateInterrupted,
+	saveNamedAgentStateToDisk as saveNamedAgentStateToDiskFile,
+} from "./named-agent-state.js";
 import { runSdkSingleAgent } from "./sdk-agent.js";
 import { ManagedRuntimeProfile } from "./runtime-profile.js";
+import { resolveManagedWorktreeIsolation } from "./worktree-isolation.js";
 
 const baseDir = path.dirname(fileURLToPath(import.meta.url));
 const promptsDir = path.join(baseDir, "prompts");
@@ -52,7 +105,11 @@ function getBundledPromptPaths(): string[] {
 	try {
 		return fs
 			.readdirSync(promptsDir, { withFileTypes: true })
-			.filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
+			.filter(
+				(entry) =>
+					(entry.isFile() || entry.isSymbolicLink()) &&
+					entry.name.endsWith(".md"),
+			)
 			.map((entry) => path.join(promptsDir, entry.name))
 			.sort();
 	} catch {
@@ -63,6 +120,96 @@ function getBundledPromptPaths(): string[] {
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+
+function sameResolvedPath(
+	left: string | undefined,
+	right: string | undefined,
+): boolean {
+	if (!left || !right) return false;
+	return path.resolve(left) === path.resolve(right);
+}
+
+function isWithinResolvedDirectory(
+	candidate: string,
+	allowedDirectory: string,
+): boolean {
+	const resolvedCandidate = path.resolve(candidate);
+	const resolvedDirectory = path.resolve(allowedDirectory);
+	return (
+		resolvedCandidate === resolvedDirectory ||
+		resolvedCandidate.startsWith(`${resolvedDirectory}${path.sep}`)
+	);
+}
+
+function isRequestedCwdAllowed(
+	requestedCwd: string | undefined,
+	allowedDirectories: string[] | undefined,
+): boolean {
+	if (!requestedCwd || !allowedDirectories || allowedDirectories.length === 0)
+		return true;
+	return allowedDirectories.some((dir) =>
+		isWithinResolvedDirectory(requestedCwd, dir),
+	);
+}
+
+function buildRuntimePermissionConfig(
+	agent: AgentConfig,
+	overrides: AgentPermissionConfig,
+	executionCwd: string,
+): AgentPermissionConfig {
+	let permissionConfig = mergePermissionConfig(agent, overrides);
+	if (agent.memory && permissionConfig.allowedDirectories) {
+		const memoryDir = getAgentMemoryDir(
+			path.resolve(executionCwd),
+			agent.name,
+			agent.memory,
+		);
+		permissionConfig = {
+			...permissionConfig,
+			allowedDirectories: [
+				...new Set([...permissionConfig.allowedDirectories, memoryDir]),
+			],
+		};
+	}
+	return permissionConfig;
+}
+
+async function resolveAgentExecutionCwd(options: {
+	stateCwd: string;
+	baseCwd: string;
+	agent: AgentConfig;
+	logicalName?: string;
+	kind?: "subagent" | "teammate";
+	teamName?: string;
+}): Promise<string> {
+	if (options.agent.isolation !== "worktree") {
+		return path.resolve(options.baseCwd);
+	}
+	if (!options.logicalName) {
+		throw new Error(
+			`Agent isolation "worktree" for "${options.agent.name}" currently requires name so the managed runtime can keep a stable worktree.`,
+		);
+	}
+	const resolved = await resolveManagedWorktreeIsolation({
+		stateCwd: options.stateCwd,
+		baseCwd: options.baseCwd,
+		name: options.logicalName,
+		kind: options.kind,
+		teamName: options.teamName,
+	});
+	return resolved.runtimeCwd;
+}
+
+async function ensureAgentIsolationReady(options: {
+	stateCwd: string;
+	baseCwd: string;
+	agent: AgentConfig;
+	logicalName?: string;
+	kind?: "subagent" | "teammate";
+	teamName?: string;
+}): Promise<void> {
+	await resolveAgentExecutionCwd(options);
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -84,7 +231,8 @@ function formatUsageStats(
 	model?: string,
 ): string {
 	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+	if (usage.turns)
+		parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
 	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
 	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
@@ -110,7 +258,8 @@ function formatToolCall(
 	switch (toolName) {
 		case "bash": {
 			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+			const preview =
+				command.length > 60 ? `${command.slice(0, 60)}...` : command;
 			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
 		}
 		case "read": {
@@ -122,7 +271,10 @@ function formatToolCall(
 			if (offset !== undefined || limit !== undefined) {
 				const startLine = offset ?? 1;
 				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+				text += themeFg(
+					"warning",
+					`:${startLine}${endLine ? `-${endLine}` : ""}`,
+				);
 			}
 			return themeFg("muted", "read ") + text;
 		}
@@ -137,7 +289,9 @@ function formatToolCall(
 		}
 		case "edit": {
 			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
+			return (
+				themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath))
+			);
 		}
 		case "ls": {
 			const rawPath = (args.path || ".") as string;
@@ -146,7 +300,11 @@ function formatToolCall(
 		case "find": {
 			const pattern = (args.pattern || "*") as string;
 			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
+			return (
+				themeFg("muted", "find ") +
+				themeFg("accent", pattern) +
+				themeFg("dim", ` in ${shortenPath(rawPath)}`)
+			);
 		}
 		case "grep": {
 			const pattern = (args.pattern || "") as string;
@@ -159,7 +317,8 @@ function formatToolCall(
 		}
 		default: {
 			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
+			const preview =
+				argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
 			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
 		}
 	}
@@ -208,7 +367,9 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
+type DisplayItem =
+	| { type: "text"; text: string }
+	| { type: "toolCall"; name: string; args: Record<string, any> };
 
 function getDisplayItems(messages: Message[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
@@ -216,7 +377,12 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		if (msg.role === "assistant") {
 			for (const part of msg.content) {
 				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+				else if (part.type === "toolCall")
+					items.push({
+						type: "toolCall",
+						name: part.name,
+						args: part.arguments,
+					});
 			}
 		}
 	}
@@ -243,12 +409,20 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-claude-subagent-"));
+async function writePromptToTempFile(
+	agentName: string,
+	prompt: string,
+): Promise<{ dir: string; filePath: string }> {
+	const tmpDir = await fs.promises.mkdtemp(
+		path.join(os.tmpdir(), "pi-claude-subagent-"),
+	);
 	const safeName = agentName.replace(/[^\w.-]+/g, "_");
 	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
 	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(filePath, prompt, {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
 	});
 	return { dir: tmpDir, filePath };
 }
@@ -293,7 +467,15 @@ async function runSingleAgent(
 			exitCode: 1,
 			messages: [],
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+				contextTokens: 0,
+				turns: 0,
+			},
 			step,
 		};
 	}
@@ -301,7 +483,8 @@ async function runSingleAgent(
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	const resolvedModel = modelOverride ?? agent.model;
 	if (resolvedModel) args.push("--model", resolvedModel);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (agent.tools && agent.tools.length > 0)
+		args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -313,7 +496,15 @@ async function runSingleAgent(
 		exitCode: 0,
 		messages: [],
 		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cost: 0,
+			contextTokens: 0,
+			turns: 0,
+		},
 		model: resolvedModel,
 		step,
 	};
@@ -321,7 +512,12 @@ async function runSingleAgent(
 	const emitUpdate = () => {
 		if (onUpdate) {
 			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+				content: [
+					{
+						type: "text",
+						text: getFinalOutput(currentResult.messages) || "(running...)",
+					},
+				],
 				details: makeDetails([currentResult]),
 			});
 		}
@@ -371,7 +567,8 @@ async function runSingleAgent(
 							currentResult.usage.cost += usage.cost?.total || 0;
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (!currentResult.model && msg.model)
+							currentResult.model = msg.model;
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
@@ -439,34 +636,62 @@ async function runSingleAgent(
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	cwd: Type.Optional(
+		Type.String({ description: "Working directory for the agent process" }),
+	),
 });
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	task: Type.String({
+		description: "Task with optional {previous} placeholder for prior output",
+	}),
+	cwd: Type.Optional(
+		Type.String({ description: "Working directory for the agent process" }),
+	),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
+	description:
+		'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
 	default: "user",
 });
 
 const PermissionModeSchema = StringEnum(AGENT_PERMISSION_MODES, {
-	description: 'Permission mode override for the managed agent runtime.',
+	description: "Permission mode override for the managed agent runtime.",
 });
 
 const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	agent: Type.Optional(
+		Type.String({
+			description: "Name of the agent to invoke (for single mode)",
+		}),
+	),
+	task: Type.Optional(
+		Type.String({ description: "Task to delegate (for single mode)" }),
+	),
+	tasks: Type.Optional(
+		Type.Array(TaskItem, {
+			description: "Array of {agent, task} for parallel execution",
+		}),
+	),
+	chain: Type.Optional(
+		Type.Array(ChainItem, {
+			description: "Array of {agent, task} for sequential execution",
+		}),
+	),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+		Type.Boolean({
+			description: "Prompt before running project-local agents. Default: true.",
+			default: true,
+		}),
 	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description: "Working directory for the agent process (single mode)",
+		}),
+	),
 });
 
 type ClaudeAgentParams = {
@@ -488,27 +713,27 @@ type ClaudeAgentParams = {
 
 type StructuredSendMessage =
 	| {
-		type: "shutdown_request";
-		request_id?: string;
-		reason?: string;
-	}
+			type: "shutdown_request";
+			request_id?: string;
+			reason?: string;
+	  }
 	| {
-		type: "shutdown_response";
-		request_id: string;
-		approve: boolean;
-		reason?: string;
-	}
+			type: "shutdown_response";
+			request_id: string;
+			approve: boolean;
+			reason?: string;
+	  }
 	| {
-		type: "plan_approval_request";
-		request_id?: string;
-		summary?: string;
-	}
+			type: "plan_approval_request";
+			request_id?: string;
+			summary?: string;
+	  }
 	| {
-		type: "plan_approval_response";
-		request_id: string;
-		approve: boolean;
-		feedback?: string;
-	};
+			type: "plan_approval_response";
+			request_id: string;
+			approve: boolean;
+			feedback?: string;
+	  };
 
 type SendMessageContent = string | StructuredSendMessage;
 
@@ -555,7 +780,8 @@ const NAMED_AGENT_STATE_ENTRY = "claude-subagent-named-agents";
 const ACTIVE_TEAM_STATE_ENTRY = "claude-subagent-active-team";
 const BACKGROUND_AGENT_MESSAGE = "claude-subagent-background";
 const DETACHED_OUTBOX_MESSAGE = "claude-subagent-detached-outbox";
-const INTERRUPTED_BACKGROUND_MESSAGE = "The parent Pi session shut down or reloaded before the background agent finished.";
+const INTERRUPTED_BACKGROUND_MESSAGE =
+	"The parent Pi session shut down or reloaded before the background agent finished.";
 const DEFAULT_TEAMMATE_AUTOCLAIM_POLL_MS = 500;
 const DETACHED_OUTBOX_POLL_MS = 1000;
 
@@ -571,15 +797,23 @@ let sessionRootCwd = process.cwd();
 let runtimeManager: AgentRuntimeManager | null = null;
 let managedTaskRegistry: ManagedTaskRegistry | null = null;
 let activeTeamState: ActiveTeamState = {};
-let notifyLeadFromChildRuntime: ((payload: ChildLeadMessagePayload) => void) | null = null;
-const teammateAutoClaimPollers = new Map<string, ReturnType<typeof setTimeout>>();
+let notifyLeadFromChildRuntime:
+	| ((payload: ChildLeadMessagePayload) => void)
+	| null = null;
+const teammateAutoClaimPollers = new Map<
+	string,
+	ReturnType<typeof setTimeout>
+>();
 let detachedOutboxPoller: ReturnType<typeof setInterval> | null = null;
 
 function getTeammatePollKey(teamName: string, teammateName: string): string {
 	return `${teamName}:${teammateName}`;
 }
 
-function clearTeammateAutoClaimPoller(teammateName: string | undefined, teamName: string | undefined): void {
+function clearTeammateAutoClaimPoller(
+	teammateName: string | undefined,
+	teamName: string | undefined,
+): void {
 	if (!teammateName || !teamName) return;
 	const key = getTeammatePollKey(teamName, teammateName);
 	const existing = teammateAutoClaimPollers.get(key);
@@ -596,7 +830,10 @@ function clearAllTeammateAutoClaimPollers(): void {
 	teammateAutoClaimPollers.clear();
 }
 
-function normalizeNamedAgentRecord(name: string, value: unknown): NamedAgentRecord | null {
+function normalizeNamedAgentRecord(
+	name: string,
+	value: unknown,
+): NamedAgentRecord | null {
 	return parseManagedRuntimeRecord(value, name);
 }
 
@@ -611,29 +848,55 @@ function createEmptyNamedAgentState(): NamedAgentState {
 let namedAgentState: NamedAgentState = createEmptyNamedAgentState();
 let persistNamedAgentStateImpl: (() => void) | null = null;
 
-function getManagedTaskIdForNamedRuntime(name: string, kind: "subagent" | "teammate", teamName?: string): string {
+function getManagedTaskIdForNamedRuntime(
+	name: string,
+	kind: "subagent" | "teammate",
+	teamName?: string,
+): string {
 	if (kind === "teammate") {
 		return `teammate:${teamName ?? "unknown"}:${name}`;
 	}
 	return `subagent:${name}`;
 }
 
-function isDetachedManagedRuntimeRunning(name: string, kind: "subagent" | "teammate", teamName?: string): boolean {
+function isDetachedManagedRuntimeRunning(
+	name: string,
+	kind: "subagent" | "teammate",
+	teamName?: string,
+): boolean {
 	const taskId = getManagedTaskIdForNamedRuntime(name, kind, teamName);
 	const task = managedTaskRegistry?.get(taskId);
-	return Boolean(task && task.status === "running" && task.runtimeKind === kind && task.detached === true);
+	return Boolean(
+		task &&
+			task.status === "running" &&
+			task.runtimeKind === kind &&
+			task.detached === true,
+	);
 }
 
-function getDetachedManagedRuntimeTask(name: string, kind: "subagent" | "teammate", teamName?: string) {
+function getDetachedManagedRuntimeTask(
+	name: string,
+	kind: "subagent" | "teammate",
+	teamName?: string,
+) {
 	const taskId = getManagedTaskIdForNamedRuntime(name, kind, teamName);
 	const task = managedTaskRegistry?.get(taskId);
-	return task && task.runtimeKind === kind && task.detached === true ? task : undefined;
+	return task && task.runtimeKind === kind && task.detached === true
+		? task
+		: undefined;
 }
 
 async function pollDetachedOutboxEvents(pi: ExtensionAPI): Promise<void> {
 	if (!managedTaskRegistry) return;
-	for (const task of managedTaskRegistry.list().filter((entry) => entry.detached === true && entry.runtimeKind === "subagent")) {
-		const events = await consumeDetachedOutboxEvents({ cwd: sessionRootCwd, runtimeKey: task.runtimeKey });
+	for (const task of managedTaskRegistry
+		.list()
+		.filter(
+			(entry) => entry.detached === true && entry.runtimeKind === "subagent",
+		)) {
+		const events = await consumeDetachedOutboxEvents({
+			cwd: sessionRootCwd,
+			runtimeKey: task.runtimeKey,
+		});
 		for (const event of events) {
 			switch (event.type) {
 				case "plan_approval_request":
@@ -673,7 +936,8 @@ async function pollDetachedOutboxEvents(pi: ExtensionAPI): Promise<void> {
 						},
 						{ deliverAs: "followUp", triggerTurn: true },
 					);
-					const refreshedNamedState = await loadNamedAgentStateFromDiskFile(sessionRootCwd);
+					const refreshedNamedState =
+						await loadNamedAgentStateFromDiskFile(sessionRootCwd);
 					namedAgentState = refreshedNamedState;
 					await persistNamedAgentState();
 					break;
@@ -716,7 +980,10 @@ function getNamedAgentRegistryPath(cwd: string): string {
 	return path.resolve(cwd, ".pi", "claude-subagent", "named-agents.json");
 }
 
-function markRunningAgentsInterrupted(state: NamedAgentState, reason: string): NamedAgentState {
+function markRunningAgentsInterrupted(
+	state: NamedAgentState,
+	reason: string,
+): NamedAgentState {
 	let changed = false;
 	const agents: Record<string, NamedAgentRecord> = {};
 	for (const [name, record] of Object.entries(state.agents)) {
@@ -736,26 +1003,45 @@ function markRunningAgentsInterrupted(state: NamedAgentState, reason: string): N
 	return changed ? { agents } : state;
 }
 
-async function loadNamedAgentStateFromDisk(cwd: string): Promise<NamedAgentState> {
+async function loadNamedAgentStateFromDisk(
+	cwd: string,
+): Promise<NamedAgentState> {
 	try {
-		const raw = await fs.promises.readFile(getNamedAgentRegistryPath(cwd), "utf-8");
+		const raw = await fs.promises.readFile(
+			getNamedAgentRegistryPath(cwd),
+			"utf-8",
+		);
 		return sanitizeNamedAgentState(JSON.parse(raw));
 	} catch {
 		return createEmptyNamedAgentState();
 	}
 }
 
-async function saveNamedAgentStateToDisk(cwd: string, state: NamedAgentState): Promise<void> {
+async function saveNamedAgentStateToDisk(
+	cwd: string,
+	state: NamedAgentState,
+): Promise<void> {
 	const filePath = getNamedAgentRegistryPath(cwd);
 	await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.promises.writeFile(filePath, JSON.stringify(normalizeNamedAgentState(state), null, 2), "utf-8");
+	await fs.promises.writeFile(
+		filePath,
+		JSON.stringify(normalizeNamedAgentState(state), null, 2),
+		"utf-8",
+	);
 }
 
 function restoreActiveTeamState(ctx: ExtensionContext): ActiveTeamState {
 	let state: ActiveTeamState = {};
 	for (const entry of ctx.sessionManager.getBranch()) {
-		const customEntry = entry as { type?: string; customType?: string; data?: unknown };
-		if (customEntry.type === "custom" && customEntry.customType === ACTIVE_TEAM_STATE_ENTRY) {
+		const customEntry = entry as {
+			type?: string;
+			customType?: string;
+			data?: unknown;
+		};
+		if (
+			customEntry.type === "custom" &&
+			customEntry.customType === ACTIVE_TEAM_STATE_ENTRY
+		) {
 			state = sanitizeActiveTeamState(customEntry.data);
 		}
 	}
@@ -765,8 +1051,15 @@ function restoreActiveTeamState(ctx: ExtensionContext): ActiveTeamState {
 function restoreNamedAgentState(ctx: ExtensionContext): NamedAgentState {
 	let state = createEmptyNamedAgentState();
 	for (const entry of ctx.sessionManager.getBranch()) {
-		const customEntry = entry as { type?: string; customType?: string; data?: unknown };
-		if (customEntry.type === "custom" && customEntry.customType === NAMED_AGENT_STATE_ENTRY) {
+		const customEntry = entry as {
+			type?: string;
+			customType?: string;
+			data?: unknown;
+		};
+		if (
+			customEntry.type === "custom" &&
+			customEntry.customType === NAMED_AGENT_STATE_ENTRY
+		) {
 			state = sanitizeNamedAgentState(customEntry.data);
 		}
 	}
@@ -798,7 +1091,10 @@ function upsertNamedAgentRecord(record: NamedAgentRecord): void {
 	};
 }
 
-function toManagedTeammateRecord(teamName: string, member: TeamMemberRecord): NamedAgentRecord | undefined {
+function toManagedTeammateRecord(
+	teamName: string,
+	member: TeamMemberRecord,
+): NamedAgentRecord | undefined {
 	if (!member.sessionFile) return undefined;
 	return {
 		name: member.name,
@@ -807,22 +1103,34 @@ function toManagedTeammateRecord(teamName: string, member: TeamMemberRecord): Na
 		sessionFile: member.sessionFile,
 		kind: "teammate",
 		teamName,
-		...(typeof member.autoClaimTasks === "boolean" ? { autoClaimTasks: member.autoClaimTasks } : {}),
+		...(typeof member.autoClaimTasks === "boolean"
+			? { autoClaimTasks: member.autoClaimTasks }
+			: {}),
 		...(member.allowedTools ? { allowedTools: member.allowedTools } : {}),
-		...(member.disallowedTools ? { disallowedTools: member.disallowedTools } : {}),
-		...(member.allowedDirectories ? { allowedDirectories: member.allowedDirectories } : {}),
+		...(member.disallowedTools
+			? { disallowedTools: member.disallowedTools }
+			: {}),
+		...(member.allowedDirectories
+			? { allowedDirectories: member.allowedDirectories }
+			: {}),
 		...(member.allowedSkills ? { allowedSkills: member.allowedSkills } : {}),
-		...(member.disallowedSkills ? { disallowedSkills: member.disallowedSkills } : {}),
+		...(member.disallowedSkills
+			? { disallowedSkills: member.disallowedSkills }
+			: {}),
 		...(member.permissionMode ? { permissionMode: member.permissionMode } : {}),
 		...(member.effort !== undefined ? { effort: member.effort } : {}),
 		...(member.mcpServers ? { mcpServers: member.mcpServers } : {}),
-		...(member.requiredMcpServers ? { requiredMcpServers: member.requiredMcpServers } : {}),
+		...(member.requiredMcpServers
+			? { requiredMcpServers: member.requiredMcpServers }
+			: {}),
 		...(member.hooks ? { hooks: member.hooks } : {}),
 		...(member.isolation ? { isolation: member.isolation } : {}),
 		...(member.model ? { model: member.model } : {}),
 		...(member.sessionId ? { sessionId: member.sessionId } : {}),
 		...(member.color ? { color: member.color } : {}),
-		...(typeof member.initialPromptApplied === "boolean" ? { initialPromptApplied: member.initialPromptApplied } : {}),
+		...(typeof member.initialPromptApplied === "boolean"
+			? { initialPromptApplied: member.initialPromptApplied }
+			: {}),
 		status: member.status ?? "idle",
 		background: false,
 		...(member.lastResultText ? { lastResultText: member.lastResultText } : {}),
@@ -871,24 +1179,39 @@ function toTeamMemberRecord(record: NamedAgentRecord): TeamMemberRecord {
 		name: record.name,
 		agentType: record.agentType,
 		cwd: record.cwd,
-		joinedAt: record.lastStartedAt ?? record.lastCompletedAt ?? new Date().toISOString(),
-		...(typeof record.autoClaimTasks === "boolean" ? { autoClaimTasks: record.autoClaimTasks } : {}),
+		joinedAt:
+			record.lastStartedAt ??
+			record.lastCompletedAt ??
+			new Date().toISOString(),
+		...(typeof record.autoClaimTasks === "boolean"
+			? { autoClaimTasks: record.autoClaimTasks }
+			: {}),
 		...(record.allowedTools ? { allowedTools: record.allowedTools } : {}),
-		...(record.disallowedTools ? { disallowedTools: record.disallowedTools } : {}),
-		...(record.allowedDirectories ? { allowedDirectories: record.allowedDirectories } : {}),
+		...(record.disallowedTools
+			? { disallowedTools: record.disallowedTools }
+			: {}),
+		...(record.allowedDirectories
+			? { allowedDirectories: record.allowedDirectories }
+			: {}),
 		...(record.allowedSkills ? { allowedSkills: record.allowedSkills } : {}),
-		...(record.disallowedSkills ? { disallowedSkills: record.disallowedSkills } : {}),
+		...(record.disallowedSkills
+			? { disallowedSkills: record.disallowedSkills }
+			: {}),
 		...(record.permissionMode ? { permissionMode: record.permissionMode } : {}),
 		...(record.effort !== undefined ? { effort: record.effort } : {}),
 		...(record.mcpServers ? { mcpServers: record.mcpServers } : {}),
-		...(record.requiredMcpServers ? { requiredMcpServers: record.requiredMcpServers } : {}),
+		...(record.requiredMcpServers
+			? { requiredMcpServers: record.requiredMcpServers }
+			: {}),
 		...(record.hooks ? { hooks: record.hooks } : {}),
 		...(record.isolation ? { isolation: record.isolation } : {}),
 		...(record.model ? { model: record.model } : {}),
 		...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
 		...(record.sessionId ? { sessionId: record.sessionId } : {}),
 		...(record.color ? { color: record.color } : {}),
-		...(typeof record.initialPromptApplied === "boolean" ? { initialPromptApplied: record.initialPromptApplied } : {}),
+		...(typeof record.initialPromptApplied === "boolean"
+			? { initialPromptApplied: record.initialPromptApplied }
+			: {}),
 		status: record.status ?? "idle",
 		...(record.lastResultText ? { lastResultText: record.lastResultText } : {}),
 		...(record.lastError ? { lastError: record.lastError } : {}),
@@ -899,15 +1222,26 @@ async function persistTeammateRecord(record: NamedAgentRecord): Promise<void> {
 	if (record.kind !== "teammate" || !record.teamName) return;
 	const team = await loadTeamRecord(sessionRootCwd, record.teamName);
 	if (!team) return;
-	await saveTeamRecord(sessionRootCwd, upsertTeamMember(team, toTeamMemberRecord(record)));
+	await saveTeamRecord(
+		sessionRootCwd,
+		upsertTeamMember(team, toTeamMemberRecord(record)),
+	);
 }
 
-async function removeTeammateMember(cwd: string, teamName: string, memberName: string): Promise<void> {
+async function removeTeammateMember(
+	cwd: string,
+	teamName: string,
+	memberName: string,
+): Promise<void> {
 	const team = await loadTeamRecord(cwd, teamName);
 	if (!team?.members[memberName]) return;
 
 	try {
-		await getSharedClaudeTodoBridge()?.unassignOwnerTasks(cwd, teamName, memberName);
+		await getSharedClaudeTodoBridge()?.unassignOwnerTasks(
+			cwd,
+			teamName,
+			memberName,
+		);
 	} catch {
 		// Keep teammate cleanup best-effort if task reclamation races or the list is missing.
 	}
@@ -938,36 +1272,58 @@ async function prunePersistedTeammates(cwd: string): Promise<void> {
 	}
 }
 
-async function maybeAutoClaimTaskForTeammate(record: NamedAgentRecord): Promise<void> {
-	if (record.kind !== "teammate" || !record.teamName || record.autoClaimTasks !== true) {
+async function maybeAutoClaimTaskForTeammate(
+	record: NamedAgentRecord,
+): Promise<void> {
+	if (
+		record.kind !== "teammate" ||
+		!record.teamName ||
+		record.autoClaimTasks !== true
+	) {
 		return;
 	}
 	if (!runtimeManager) return;
 	const claudeTodoBridge = getSharedClaudeTodoBridge();
 	if (!claudeTodoBridge) return;
 
-	const current = runtimeManager.get(record.name, { kind: "teammate", teamName: record.teamName });
+	const current = runtimeManager.get(record.name, {
+		kind: "teammate",
+		teamName: record.teamName,
+	});
 	if (!current) return;
 	if (current.status !== "completed" && current.status !== "idle") {
 		return;
 	}
 
-	const tasks = claudeTodoBridge.filterExternalTasks(await claudeTodoBridge.listTasks(sessionRootCwd, record.teamName));
+	const tasks = claudeTodoBridge.filterExternalTasks(
+		await claudeTodoBridge.listTasks(sessionRootCwd, record.teamName),
+	);
 	const nextTask = claudeTodoBridge.findAvailableTask(tasks);
 	if (!nextTask) {
 		scheduleTeammateAutoClaim(record);
 		return;
 	}
 
-	const claimResult = await claudeTodoBridge.claimTask(sessionRootCwd, record.teamName, nextTask.id, record.name, {
-		checkAgentBusy: true,
-	});
+	const claimResult = await claudeTodoBridge.claimTask(
+		sessionRootCwd,
+		record.teamName,
+		nextTask.id,
+		record.name,
+		{
+			checkAgentBusy: true,
+		},
+	);
 	if (!claimResult.success) {
 		scheduleTeammateAutoClaim(current);
 		return;
 	}
 
-	await claudeTodoBridge.markTaskInProgress(sessionRootCwd, record.teamName, nextTask.id, record.name);
+	await claudeTodoBridge.markTaskInProgress(
+		sessionRootCwd,
+		record.teamName,
+		nextTask.id,
+		record.name,
+	);
 	await runtimeManager.launchExistingBackground({
 		name: record.name,
 		kind: "teammate",
@@ -978,7 +1334,11 @@ async function maybeAutoClaimTaskForTeammate(record: NamedAgentRecord): Promise<
 }
 
 function scheduleTeammateAutoClaim(record: NamedAgentRecord): void {
-	if (record.kind !== "teammate" || !record.teamName || record.autoClaimTasks !== true) {
+	if (
+		record.kind !== "teammate" ||
+		!record.teamName ||
+		record.autoClaimTasks !== true
+	) {
 		return;
 	}
 	const key = getTeammatePollKey(record.teamName, record.name);
@@ -992,17 +1352,21 @@ function scheduleTeammateAutoClaim(record: NamedAgentRecord): void {
 	teammateAutoClaimPollers.set(key, timer);
 }
 
-function formatBackgroundNotification(details: BackgroundAgentNotification): string {
-	const statusLabel = details.status === "launched"
-		? "launched"
-		: details.status === "completed"
-			? "completed"
-			: details.status === "failed"
-				? "failed"
-				: "interrupted";
-	const subject = (details.kind === "teammate" || Boolean(details.teamName))
-		? `Teammate "${details.name}" (${details.agentType})${details.teamName ? ` in team "${details.teamName}"` : ""}`
-		: `Background agent "${details.name}" (${details.agentType})`;
+function formatBackgroundNotification(
+	details: BackgroundAgentNotification,
+): string {
+	const statusLabel =
+		details.status === "launched"
+			? "launched"
+			: details.status === "completed"
+				? "completed"
+				: details.status === "failed"
+					? "failed"
+					: "interrupted";
+	const subject =
+		details.kind === "teammate" || Boolean(details.teamName)
+			? `Teammate "${details.name}" (${details.agentType})${details.teamName ? ` in team "${details.teamName}"` : ""}`
+			: `Background agent "${details.name}" (${details.agentType})`;
 	let text = `${subject} ${statusLabel}.`;
 	if (details.description) {
 		text += `
@@ -1018,16 +1382,30 @@ Result: ${details.resultText}`;
 	return text;
 }
 
-function renderBackgroundNotification(message: any, options: any, theme: any): Text {
+function renderBackgroundNotification(
+	message: any,
+	options: any,
+	theme: any,
+): Text {
 	const details = message.details as BackgroundAgentNotification | undefined;
 	const status = details?.status ?? "completed";
-	const color = status === "completed" ? "success" : status === "launched" ? "warning" : "error";
-	const base = typeof message.content === "string" ? message.content : formatBackgroundNotification(details ?? {
-		name: "agent",
-		agentType: "general-purpose",
-		cwd: sessionRootCwd,
-		status,
-	});
+	const color =
+		status === "completed"
+			? "success"
+			: status === "launched"
+				? "warning"
+				: "error";
+	const base =
+		typeof message.content === "string"
+			? message.content
+			: formatBackgroundNotification(
+					details ?? {
+						name: "agent",
+						agentType: "general-purpose",
+						cwd: sessionRootCwd,
+						status,
+					},
+				);
 	const prefix = theme.fg(color, `[${status.toUpperCase()}]`);
 	let text = `${prefix} ${base}`;
 	if (options?.expanded && details?.sessionFile) {
@@ -1036,7 +1414,11 @@ function renderBackgroundNotification(message: any, options: any, theme: any): T
 	return new Text(text, 0, 0);
 }
 
-function makeBackgroundLaunchResult(record: NamedAgentRecord, agent: AgentConfig, task: string): SingleResult {
+function makeBackgroundLaunchResult(
+	record: NamedAgentRecord,
+	agent: AgentConfig,
+	task: string,
+): SingleResult {
 	return {
 		agent: agent.name,
 		agentSource: agent.source,
@@ -1044,7 +1426,15 @@ function makeBackgroundLaunchResult(record: NamedAgentRecord, agent: AgentConfig
 		exitCode: 0,
 		messages: [],
 		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			cost: 0,
+			contextTokens: 0,
+			turns: 0,
+		},
 		model: record.model,
 		stopReason: "background",
 		errorMessage: undefined,
@@ -1052,9 +1442,15 @@ function makeBackgroundLaunchResult(record: NamedAgentRecord, agent: AgentConfig
 }
 
 const TeamCreateParamsSchema = Type.Object({
-	team_name: Type.String({ description: "Name for the team to create or activate" }),
-	description: Type.Optional(Type.String({ description: "Optional team description" })),
-	agent_type: Type.Optional(Type.String({ description: "Optional lead agent type label" })),
+	team_name: Type.String({
+		description: "Name for the team to create or activate",
+	}),
+	description: Type.Optional(
+		Type.String({ description: "Optional team description" }),
+	),
+	agent_type: Type.Optional(
+		Type.String({ description: "Optional lead agent type label" }),
+	),
 });
 
 const TeamDeleteParamsSchema = Type.Object({});
@@ -1062,25 +1458,53 @@ const TeamDeleteParamsSchema = Type.Object({});
 const StructuredSendMessageSchema = Type.Union([
 	Type.Object({
 		type: Type.Literal("shutdown_request"),
-		request_id: Type.Optional(Type.String({ description: "Optional request ID. Generated automatically when omitted." })),
-		reason: Type.Optional(Type.String({ description: "Why the recipient should stop." })),
+		request_id: Type.Optional(
+			Type.String({
+				description:
+					"Optional request ID. Generated automatically when omitted.",
+			}),
+		),
+		reason: Type.Optional(
+			Type.String({ description: "Why the recipient should stop." }),
+		),
 	}),
 	Type.Object({
 		type: Type.Literal("shutdown_response"),
-		request_id: Type.String({ description: "The shutdown request ID being answered." }),
+		request_id: Type.String({
+			description: "The shutdown request ID being answered.",
+		}),
 		approve: Type.Boolean({ description: "Whether shutdown is approved." }),
-		reason: Type.Optional(Type.String({ description: "Optional explanation for the response." })),
+		reason: Type.Optional(
+			Type.String({ description: "Optional explanation for the response." }),
+		),
 	}),
 	Type.Object({
 		type: Type.Literal("plan_approval_request"),
-		request_id: Type.Optional(Type.String({ description: "Optional request ID. Generated automatically when omitted." })),
-		summary: Type.Optional(Type.String({ description: "Short summary of the plan awaiting approval." })),
+		request_id: Type.Optional(
+			Type.String({
+				description:
+					"Optional request ID. Generated automatically when omitted.",
+			}),
+		),
+		summary: Type.Optional(
+			Type.String({
+				description: "Short summary of the plan awaiting approval.",
+			}),
+		),
 	}),
 	Type.Object({
 		type: Type.Literal("plan_approval_response"),
-		request_id: Type.String({ description: "The plan approval request ID being answered." }),
-		approve: Type.Boolean({ description: "Whether the proposed plan is approved." }),
-		feedback: Type.Optional(Type.String({ description: "Optional revision feedback when the plan is rejected." })),
+		request_id: Type.String({
+			description: "The plan approval request ID being answered.",
+		}),
+		approve: Type.Boolean({
+			description: "Whether the proposed plan is approved.",
+		}),
+		feedback: Type.Optional(
+			Type.String({
+				description: "Optional revision feedback when the plan is rejected.",
+			}),
+		),
 	}),
 ]);
 
@@ -1090,33 +1514,88 @@ const SendMessageParamsSchema = Type.Object({
 		Type.String({ description: "Message to deliver to the named agent" }),
 		StructuredSendMessageSchema,
 	]),
-	summary: Type.Optional(Type.String({ description: "Optional short summary shown in the UI" })),
+	summary: Type.Optional(
+		Type.String({ description: "Optional short summary shown in the UI" }),
+	),
 });
 
 const AgentParams = Type.Object({
-	description: Type.String({ description: "A short (3-5 word) description of the task" }),
+	description: Type.String({
+		description: "A short (3-5 word) description of the task",
+	}),
 	prompt: Type.String({ description: "The task for the agent to perform" }),
-	subagent_type: Type.Optional(Type.String({ description: "The type of specialized agent to use for this task" })),
-	model: Type.Optional(Type.String({ description: "Optional model override for this agent" })),
-	allowed_tools: Type.Optional(Type.Array(Type.String(), { description: "Optional tool allowlist for this agent runtime" })),
-	disallowed_tools: Type.Optional(Type.Array(Type.String(), { description: "Optional tool denylist for this agent runtime" })),
-	allowed_directories: Type.Optional(Type.Array(Type.String(), { description: "Optional directory allowlist for file-based tools" })),
-	allowed_skills: Type.Optional(Type.Array(Type.String(), { description: "Optional skill allowlist for this agent runtime" })),
-	disallowed_skills: Type.Optional(Type.Array(Type.String(), { description: "Optional skill denylist for this agent runtime" })),
+	subagent_type: Type.Optional(
+		Type.String({
+			description: "The type of specialized agent to use for this task",
+		}),
+	),
+	model: Type.Optional(
+		Type.String({ description: "Optional model override for this agent" }),
+	),
+	allowed_tools: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Optional tool allowlist for this agent runtime",
+		}),
+	),
+	disallowed_tools: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Optional tool denylist for this agent runtime",
+		}),
+	),
+	allowed_directories: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Optional directory allowlist for file-based tools",
+		}),
+	),
+	allowed_skills: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Optional skill allowlist for this agent runtime",
+		}),
+	),
+	disallowed_skills: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Optional skill denylist for this agent runtime",
+		}),
+	),
 	mode: Type.Optional(PermissionModeSchema),
-	run_in_background: Type.Optional(Type.Boolean({ description: "Set to true to run this agent in the background" })),
-	name: Type.Optional(Type.String({ description: "Optional name for persistent continuation. Required for run_in_background." })),
-	team_name: Type.Optional(Type.String({ description: "Optional local team context for spawning an in-process teammate" })),
-	cwd: Type.Optional(Type.String({ description: "Optional working directory override for this agent process" })),
+	run_in_background: Type.Optional(
+		Type.Boolean({
+			description: "Set to true to run this agent in the background",
+		}),
+	),
+	name: Type.Optional(
+		Type.String({
+			description:
+				"Optional name for persistent continuation. Required for run_in_background.",
+		}),
+	),
+	team_name: Type.Optional(
+		Type.String({
+			description:
+				"Optional local team context for spawning an in-process teammate",
+		}),
+	),
+	cwd: Type.Optional(
+		Type.String({
+			description: "Optional working directory override for this agent process",
+		}),
+	),
 });
 
-function isStructuredSendMessage(message: SendMessageContent): message is StructuredSendMessage {
+function isStructuredSendMessage(
+	message: SendMessageContent,
+): message is StructuredSendMessage {
 	return typeof message !== "string";
 }
 
-function normalizeSendMessageContent(message: SendMessageContent): SendMessageContent {
+function normalizeSendMessageContent(
+	message: SendMessageContent,
+): SendMessageContent {
 	if (!isStructuredSendMessage(message)) return message;
-	if (message.type === "shutdown_request" || message.type === "plan_approval_request") {
+	if (
+		message.type === "shutdown_request" ||
+		message.type === "plan_approval_request"
+	) {
 		return {
 			...message,
 			request_id: message.request_id?.trim() || randomUUID(),
@@ -1135,7 +1614,9 @@ function getSendMessagePreview(message: SendMessageContent): string {
 	return serialized.length > 80 ? `${serialized.slice(0, 80)}...` : serialized;
 }
 
-function getDefaultSendMessageSummary(message: SendMessageContent): string | undefined {
+function getDefaultSendMessageSummary(
+	message: SendMessageContent,
+): string | undefined {
 	if (!isStructuredSendMessage(message)) return undefined;
 	switch (message.type) {
 		case "shutdown_request":
@@ -1152,11 +1633,14 @@ function getDefaultSendMessageSummary(message: SendMessageContent): string | und
 }
 
 function formatChildLeadMessage(payload: ChildLeadMessagePayload): string {
-	const prefix = payload.senderKind === "teammate"
-		? `Teammate "${payload.from}"`
-		: `Agent "${payload.from}"`;
-	const summaryLine = payload.summary ? `Summary: ${payload.summary}
-` : "";
+	const prefix =
+		payload.senderKind === "teammate"
+			? `Teammate "${payload.from}"`
+			: `Agent "${payload.from}"`;
+	const summaryLine = payload.summary
+		? `Summary: ${payload.summary}
+`
+		: "";
 	if (typeof payload.message === "string") {
 		return `${prefix} sent a message to team-lead.${payload.teamName ? ` Team: ${payload.teamName}.` : ""}
 ${summaryLine}Message: ${payload.message}`;
@@ -1176,21 +1660,28 @@ ${summaryLine}Message: ${payload.message}`;
 	}
 }
 
-function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): ToolDefinition[] {
+function buildChildSendMessageBridgeTools(
+	context: ChildRuntimeToolContext,
+): ToolDefinition[] {
 	return [
 		defineTool({
 			name: "SendMessage",
 			label: "SendMessage",
-			description: "Send a follow-up message to another managed runtime or back to team-lead.",
+			description:
+				"Send a follow-up message to another managed runtime or back to team-lead.",
 			parameters: SendMessageParamsSchema,
 			async execute(_toolCallId, rawParams: SendMessageParams) {
 				const params = rawParams as SendMessageParams;
 				const target = params.to.trim();
 				const normalizedMessage = normalizeSendMessageContent(params.message);
-				const summary = params.summary?.trim() || getDefaultSendMessageSummary(normalizedMessage);
+				const summary =
+					params.summary?.trim() ||
+					getDefaultSendMessageSummary(normalizedMessage);
 				if (!target) {
 					return {
-						content: [{ type: "text", text: "SendMessage target must not be empty." }],
+						content: [
+							{ type: "text", text: "SendMessage target must not be empty." },
+						],
 						details: { to: "", agentType: "unknown", delivery: "queued" },
 						isError: true,
 					};
@@ -1199,8 +1690,19 @@ function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): Too
 				if (target === "team-lead") {
 					if (!notifyLeadFromChildRuntime) {
 						return {
-							content: [{ type: "text", text: "The parent session bridge is not available right now." }],
-							details: { to: target, agentType: "team-lead", delivery: "queued", kind: context.senderKind, teamName: context.teamName },
+							content: [
+								{
+									type: "text",
+									text: "The parent session bridge is not available right now.",
+								},
+							],
+							details: {
+								to: target,
+								agentType: "team-lead",
+								delivery: "queued",
+								kind: context.senderKind,
+								teamName: context.teamName,
+							},
 							isError: true,
 						};
 					}
@@ -1212,17 +1714,49 @@ function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): Too
 						message: normalizedMessage,
 					});
 					return {
-						content: [{ type: "text", text: "Message delivered to team-lead." }],
-						details: { to: target, agentType: "team-lead", delivery: "queued", kind: context.senderKind, teamName: context.teamName, ...(isStructuredSendMessage(normalizedMessage) && "request_id" in normalizedMessage && normalizedMessage.request_id ? { requestId: normalizedMessage.request_id } : {}), ...(isStructuredSendMessage(normalizedMessage) ? { messageType: normalizedMessage.type } : {}) },
+						content: [
+							{ type: "text", text: "Message delivered to team-lead." },
+						],
+						details: {
+							to: target,
+							agentType: "team-lead",
+							delivery: "queued",
+							kind: context.senderKind,
+							teamName: context.teamName,
+							...(isStructuredSendMessage(normalizedMessage) &&
+							"request_id" in normalizedMessage &&
+							normalizedMessage.request_id
+								? { requestId: normalizedMessage.request_id }
+								: {}),
+							...(isStructuredSendMessage(normalizedMessage)
+								? { messageType: normalizedMessage.type }
+								: {}),
+						},
 					};
 				}
 
-				if (target === "*" && context.senderKind === "teammate" && context.teamName && runtimeManager) {
+				if (
+					target === "*" &&
+					context.senderKind === "teammate" &&
+					context.teamName &&
+					runtimeManager
+				) {
 					const team = await loadTeamRecord(context.cwd, context.teamName);
 					if (!team) {
 						return {
-							content: [{ type: "text", text: `Team "${context.teamName}" no longer exists.` }],
-							details: { to: target, agentType: "team", delivery: "queued", kind: context.senderKind, teamName: context.teamName },
+							content: [
+								{
+									type: "text",
+									text: `Team "${context.teamName}" no longer exists.`,
+								},
+							],
+							details: {
+								to: target,
+								agentType: "team",
+								delivery: "queued",
+								kind: context.senderKind,
+								teamName: context.teamName,
+							},
 							isError: true,
 						};
 					}
@@ -1230,9 +1764,14 @@ function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): Too
 					const discovery = discoverAgents(context.cwd, "both");
 					for (const member of Object.values(team.members)) {
 						if (member.name === context.senderName) continue;
-						const liveRecord = runtimeManager.get(member.name, { kind: "teammate", teamName: context.teamName });
+						const liveRecord = runtimeManager.get(member.name, {
+							kind: "teammate",
+							teamName: context.teamName,
+						});
 						if (!liveRecord) continue;
-						const selectedAgent = discovery.agents.find((agent) => agent.name === liveRecord.agentType);
+						const selectedAgent = discovery.agents.find(
+							(agent) => agent.name === liveRecord.agentType,
+						);
 						if (!selectedAgent) continue;
 						await runtimeManager.sendMessage({
 							kind: "teammate",
@@ -1242,8 +1781,8 @@ function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): Too
 							agent: selectedAgent,
 							message: serializeSendMessageContent(normalizedMessage),
 							summary,
-							defaultCwd: context.cwd,
-							requestedCwd: liveRecord.cwd,
+							defaultCwd: liveRecord.cwd,
+							sessionCwd: context.cwd,
 							modelRegistry: context.runtimeContext.modelRegistry,
 							currentModel: context.runtimeContext.currentModel,
 							modelOverride: liveRecord.model,
@@ -1258,15 +1797,41 @@ function buildChildSendMessageBridgeTools(context: ChildRuntimeToolContext): Too
 						recipients.push(liveRecord.name);
 					}
 					return {
-						content: [{ type: "text", text: recipients.length > 0 ? `Broadcast delivered to ${recipients.length} teammate(s).` : "No other live teammates were available for broadcast." }],
-						details: { to: target, agentType: "team", delivery: "queued", kind: context.senderKind, teamName: context.teamName, recipients, ...(isStructuredSendMessage(normalizedMessage) ? { messageType: normalizedMessage.type } : {}) },
+						content: [
+							{
+								type: "text",
+								text:
+									recipients.length > 0
+										? `Broadcast delivered to ${recipients.length} teammate(s).`
+										: "No other live teammates were available for broadcast.",
+							},
+						],
+						details: {
+							to: target,
+							agentType: "team",
+							delivery: "queued",
+							kind: context.senderKind,
+							teamName: context.teamName,
+							recipients,
+							...(isStructuredSendMessage(normalizedMessage)
+								? { messageType: normalizedMessage.type }
+								: {}),
+						},
 					};
 				}
 
 				const result = await executeSendMessageTool(
-					{ ...params, message: normalizedMessage, ...(summary ? { summary } : {}) },
+					{
+						...params,
+						message: normalizedMessage,
+						...(summary ? { summary } : {}),
+					},
 					undefined,
-					{ cwd: context.cwd, modelRegistry: context.runtimeContext.modelRegistry, model: context.runtimeContext.currentModel } as ExtensionContext,
+					{
+						cwd: context.cwd,
+						modelRegistry: context.runtimeContext.modelRegistry,
+						model: context.runtimeContext.currentModel,
+					} as ExtensionContext,
 				);
 				return result;
 			},
@@ -1284,11 +1849,11 @@ function buildTeammateRuntimeCustomTools(options: {
 	return [
 		...(claudeTodoBridge
 			? claudeTodoBridge.buildClaudeTodoCustomTools({
-				cwd: options.cwd,
-				taskListId: options.teamName,
-				actingAgentName: options.actingAgentName,
-				runtimeContext: options.runtimeContext,
-			})
+					cwd: options.cwd,
+					taskListId: options.teamName,
+					actingAgentName: options.actingAgentName,
+					runtimeContext: options.runtimeContext,
+				})
 			: []),
 		...buildChildSendMessageBridgeTools({
 			cwd: options.cwd,
@@ -1346,11 +1911,16 @@ function createManagedPlanModeBridge(options: {
 	};
 }
 
-async function persistDetachedLaunchRecord(record: NamedAgentRecord): Promise<void> {
+async function persistDetachedLaunchRecord(
+	record: NamedAgentRecord,
+): Promise<void> {
 	if (record.kind === "teammate" && record.teamName) {
 		const team = await loadTeamRecord(sessionRootCwd, record.teamName);
 		if (team) {
-			await saveTeamRecord(sessionRootCwd, upsertTeamMember(team, toTeamMemberRecord(record)));
+			await saveTeamRecord(
+				sessionRootCwd,
+				upsertTeamMember(team, toTeamMemberRecord(record)),
+			);
 		}
 		return;
 	}
@@ -1364,12 +1934,18 @@ async function persistDetachedLaunchRecord(record: NamedAgentRecord): Promise<vo
 	await persistNamedAgentState();
 }
 
-async function stopManagedRuntime(target: string, options: {
-	kind: NamedAgentRecord["kind"];
-	teamName?: string;
-}): Promise<boolean> {
+async function stopManagedRuntime(
+	target: string,
+	options: {
+		kind: "subagent" | "teammate";
+		teamName?: string;
+	},
+): Promise<boolean> {
 	const stoppedLive = runtimeManager
-		? await runtimeManager.abort(target, { kind: options.kind, ...(options.teamName ? { teamName: options.teamName } : {}) })
+		? await runtimeManager.abort(target, {
+				kind: options.kind,
+				...(options.teamName ? { teamName: options.teamName } : {}),
+			})
 		: false;
 	if (stoppedLive) return true;
 	if (isDetachedManagedRuntimeRunning(target, options.kind, options.teamName)) {
@@ -1387,12 +1963,14 @@ async function stopManagedRuntime(target: string, options: {
 
 function renderAgentCall(args: ClaudeAgentParams, theme: any): Text {
 	const agentName = args.subagent_type?.trim() || "general-purpose";
-	const preview = args.prompt.length > 80 ? `${args.prompt.slice(0, 80)}...` : args.prompt;
+	const preview =
+		args.prompt.length > 80 ? `${args.prompt.slice(0, 80)}...` : args.prompt;
 	let text =
 		theme.fg("toolTitle", theme.bold("Agent ")) +
 		theme.fg("accent", agentName) +
 		theme.fg("muted", ` ${args.description}`);
-	if (args.run_in_background) text += theme.fg("warning", " [background requested]");
+	if (args.run_in_background)
+		text += theme.fg("warning", " [background requested]");
 	text += `
   ${theme.fg("dim", preview)}`;
 	return new Text(text, 0, 0);
@@ -1412,7 +1990,9 @@ function renderSendMessageCall(args: SendMessageParams, theme: any): Text {
 }
 
 function renderTeamCreateCall(args: TeamCreateParams, theme: any): Text {
-	let text = theme.fg("toolTitle", theme.bold("TeamCreate ")) + theme.fg("accent", args.team_name);
+	let text =
+		theme.fg("toolTitle", theme.bold("TeamCreate ")) +
+		theme.fg("accent", args.team_name);
 	if (args.description?.trim()) {
 		text += `
   ${theme.fg("dim", args.description.trim())}`;
@@ -1434,7 +2014,11 @@ function renderTeamDeleteResult(result: any, _options: any, _theme: any): Text {
 	return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 }
 
-function renderSendMessageResult(result: any, _options: any, _theme: any): Text {
+function renderSendMessageResult(
+	result: any,
+	_options: any,
+	_theme: any,
+): Text {
 	const first = result.content?.[0];
 	return new Text(first?.type === "text" ? first.text : "(no output)", 0, 0);
 }
@@ -1454,12 +2038,24 @@ async function executeTeamCreateTool(
 
 	const existing = await loadTeamRecord(ctx.cwd, teamName);
 	if (existing) {
-		await getSharedClaudeTodoBridge()?.ensureTaskListDir(ctx.cwd, existing.name);
+		await getSharedClaudeTodoBridge()?.ensureTaskListDir(
+			ctx.cwd,
+			existing.name,
+		);
 		activeTeamState = { teamName: existing.name };
 		await persistActiveTeamState();
 		return {
-			content: [{ type: "text", text: `Team "${existing.name}" is now the active local team.` }],
-			details: { team_name: existing.name, created: false, member_count: Object.keys(existing.members).length },
+			content: [
+				{
+					type: "text",
+					text: `Team "${existing.name}" is now the active local team.`,
+				},
+			],
+			details: {
+				team_name: existing.name,
+				created: false,
+				member_count: Object.keys(existing.members).length,
+			},
 		};
 	}
 
@@ -1476,7 +2072,12 @@ async function executeTeamCreateTool(
 	activeTeamState = { teamName: created.name };
 	await persistActiveTeamState();
 	return {
-		content: [{ type: "text", text: `Created local team "${created.name}", initialized its shared task list, and set it active for teammate routing.` }],
+		content: [
+			{
+				type: "text",
+				text: `Created local team "${created.name}", initialized its shared task list, and set it active for teammate routing.`,
+			},
+		],
 		details: { team_name: created.name, created: true, member_count: 0 },
 	};
 }
@@ -1504,21 +2105,38 @@ async function executeTeamDeleteTool(
 		activeTeamState = {};
 		await persistActiveTeamState();
 		return {
-			content: [{ type: "text", text: `Team "${teamName}" was already missing. Cleared the active team context.` }],
+			content: [
+				{
+					type: "text",
+					text: `Team "${teamName}" was already missing. Cleared the active team context.`,
+				},
+			],
 			details: { team_name: teamName, deleted: true, member_count: 0 },
 		};
 	}
 
-	const liveMembers = runtimeManager?.list().filter((record) =>
-		record.kind === "teammate" && record.teamName === team.name && record.status === "running",
-	) ?? [];
+	const liveMembers =
+		runtimeManager
+			?.list()
+			.filter(
+				(record) =>
+					record.kind === "teammate" &&
+					record.teamName === team.name &&
+					record.status === "running",
+			) ?? [];
 	if (liveMembers.length > 0) {
 		return {
-			content: [{
-				type: "text",
-				text: `Cannot delete team "${team.name}" while ${liveMembers.length} teammate(s) are still running: ${liveMembers.map((member) => member.name).join(", ")}. Stop them first, for example with SendMessage using a structured shutdown_request.`,
-			}],
-			details: { team_name: team.name, deleted: false, member_count: Object.keys(team.members).length },
+			content: [
+				{
+					type: "text",
+					text: `Cannot delete team "${team.name}" while ${liveMembers.length} teammate(s) are still running: ${liveMembers.map((member) => member.name).join(", ")}. Stop them first, for example with SendMessage using a structured shutdown_request.`,
+				},
+			],
+			details: {
+				team_name: team.name,
+				deleted: false,
+				member_count: Object.keys(team.members).length,
+			},
 			isError: true,
 		};
 	}
@@ -1526,7 +2144,11 @@ async function executeTeamDeleteTool(
 	for (const memberName of Object.keys(team.members)) {
 		clearTeammateAutoClaimPoller(memberName, team.name);
 		try {
-			await getSharedClaudeTodoBridge()?.unassignOwnerTasks(ctx.cwd, team.name, memberName);
+			await getSharedClaudeTodoBridge()?.unassignOwnerTasks(
+				ctx.cwd,
+				team.name,
+				memberName,
+			);
 		} catch {
 			// Keep deletion best-effort if ownership cleanup races the task list watcher.
 		}
@@ -1534,7 +2156,10 @@ async function executeTeamDeleteTool(
 
 	await deleteTeamRecord(ctx.cwd, team.name);
 	try {
-		const taskListDir = getSharedClaudeTodoBridge()?.getTaskListDir(ctx.cwd, team.name);
+		const taskListDir = getSharedClaudeTodoBridge()?.getTaskListDir(
+			ctx.cwd,
+			team.name,
+		);
 		if (taskListDir) {
 			await fs.promises.rm(taskListDir, { recursive: true, force: true });
 		}
@@ -1542,12 +2167,22 @@ async function executeTeamDeleteTool(
 		// Ignore task-list cleanup races; the team file is the primary source of truth.
 	}
 
-	activeTeamState = activeTeamState.teamName === team.name ? {} : activeTeamState;
+	activeTeamState =
+		activeTeamState.teamName === team.name ? {} : activeTeamState;
 	await persistActiveTeamState();
 
 	return {
-		content: [{ type: "text", text: `Deleted local team "${team.name}" and cleaned up its shared task list.` }],
-		details: { team_name: team.name, deleted: true, member_count: Object.keys(team.members).length },
+		content: [
+			{
+				type: "text",
+				text: `Deleted local team "${team.name}" and cleaned up its shared task list.`,
+			},
+		],
+		details: {
+			team_name: team.name,
+			deleted: true,
+			member_count: Object.keys(team.members).length,
+		},
 	};
 }
 
@@ -1558,21 +2193,28 @@ async function executeSendMessageTool(
 ): Promise<AgentToolResult<SendMessageDetails>> {
 	const target = params.to.trim();
 	const normalizedMessage = normalizeSendMessageContent(params.message);
-	const summary = params.summary?.trim() || getDefaultSendMessageSummary(normalizedMessage);
+	const summary =
+		params.summary?.trim() || getDefaultSendMessageSummary(normalizedMessage);
 	const messageText = serializeSendMessageContent(normalizedMessage);
-	const shutdownRequest = isStructuredSendMessage(normalizedMessage) && normalizedMessage.type === "shutdown_request"
-		? normalizedMessage
-		: undefined;
+	const shutdownRequest =
+		isStructuredSendMessage(normalizedMessage) &&
+		normalizedMessage.type === "shutdown_request"
+			? normalizedMessage
+			: undefined;
 	if (!target) {
 		return {
-			content: [{ type: "text", text: "SendMessage target must not be empty." }],
+			content: [
+				{ type: "text", text: "SendMessage target must not be empty." },
+			],
 			details: { to: "", agentType: "unknown", delivery: "queued" },
 			isError: true,
 		};
 	}
 	if (!runtimeManager) {
 		return {
-			content: [{ type: "text", text: "Agent runtime manager is not initialized." }],
+			content: [
+				{ type: "text", text: "Agent runtime manager is not initialized." },
+			],
 			details: { to: target, agentType: "unknown", delivery: "queued" },
 			isError: true,
 		};
@@ -1589,13 +2231,22 @@ async function executeSendMessageTool(
 
 	const discovery = discoverAgents(ctx.cwd, "both");
 	const activeTeamName = activeTeamState.teamName;
-	const activeTeam = activeTeamName ? await loadTeamRecord(ctx.cwd, activeTeamName) : null;
-	const currentModelLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	const activeTeam = activeTeamName
+		? await loadTeamRecord(ctx.cwd, activeTeamName)
+		: null;
+	const currentModelLabel = ctx.model
+		? `${ctx.model.provider}/${ctx.model.id}`
+		: undefined;
 
 	if (target === "*") {
 		if (!activeTeamName || !activeTeam) {
 			return {
-				content: [{ type: "text", text: "Broadcast routing requires an active local team. Use TeamCreate first." }],
+				content: [
+					{
+						type: "text",
+						text: "Broadcast routing requires an active local team. Use TeamCreate first.",
+					},
+				],
 				details: { to: target, agentType: "team", delivery: "queued" },
 				isError: true,
 			};
@@ -1603,8 +2254,19 @@ async function executeSendMessageTool(
 		const members = Object.values(activeTeam.members);
 		if (members.length === 0) {
 			return {
-				content: [{ type: "text", text: `Team "${activeTeamName}" has no teammates to message yet.` }],
-				details: { to: target, agentType: "team", delivery: "queued", teamName: activeTeamName, recipients: [] },
+				content: [
+					{
+						type: "text",
+						text: `Team "${activeTeamName}" has no teammates to message yet.`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: "team",
+					delivery: "queued",
+					teamName: activeTeamName,
+					recipients: [],
+				},
 				isError: true,
 			};
 		}
@@ -1612,44 +2274,88 @@ async function executeSendMessageTool(
 		const recipients: string[] = [];
 		if (shutdownRequest) {
 			for (const member of members) {
-				const liveRecord = runtimeManager.get(member.name, { kind: "teammate", teamName: activeTeamName });
+				const liveRecord = runtimeManager.get(member.name, {
+					kind: "teammate",
+					teamName: activeTeamName,
+				});
 				if (!liveRecord) {
 					await removeTeammateMember(ctx.cwd, activeTeamName, member.name);
 					continue;
 				}
-				await stopManagedRuntime(liveRecord.name, { kind: "teammate", teamName: activeTeamName });
+				await stopManagedRuntime(liveRecord.name, {
+					kind: "teammate",
+					teamName: activeTeamName,
+				});
 				recipients.push(liveRecord.name);
 			}
 
 			if (recipients.length === 0) {
 				return {
-					content: [{ type: "text", text: `Team "${activeTeamName}" has no live teammates in this Pi session. Relaunch them with Agent(team_name + name) first.` }],
-					details: { to: target, agentType: "team", delivery: "stopped", teamName: activeTeamName, recipients: [], requestId: shutdownRequest.request_id, messageType: shutdownRequest.type },
+					content: [
+						{
+							type: "text",
+							text: `Team "${activeTeamName}" has no live teammates in this Pi session. Relaunch them with Agent(team_name + name) first.`,
+						},
+					],
+					details: {
+						to: target,
+						agentType: "team",
+						delivery: "stopped",
+						teamName: activeTeamName,
+						recipients: [],
+						requestId: shutdownRequest.request_id,
+						messageType: shutdownRequest.type,
+					},
 					isError: true,
 				};
 			}
 
 			return {
-				content: [{
-					type: "text",
-					text: `Shutdown requested for ${recipients.length} teammate(s) in team "${activeTeamName}".`,
-				}],
-				details: { to: target, agentType: "team", delivery: "stopped", teamName: activeTeamName, recipients, requestId: shutdownRequest.request_id, messageType: shutdownRequest.type },
+				content: [
+					{
+						type: "text",
+						text: `Shutdown requested for ${recipients.length} teammate(s) in team "${activeTeamName}".`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: "team",
+					delivery: "stopped",
+					teamName: activeTeamName,
+					recipients,
+					requestId: shutdownRequest.request_id,
+					messageType: shutdownRequest.type,
+				},
 			};
 		}
 
 		for (const member of members) {
-			const liveRecord = runtimeManager.get(member.name, { kind: "teammate", teamName: activeTeamName });
+			const liveRecord = runtimeManager.get(member.name, {
+				kind: "teammate",
+				teamName: activeTeamName,
+			});
 			if (!liveRecord) {
 				await removeTeammateMember(ctx.cwd, activeTeamName, member.name);
 				continue;
 			}
 
-			const selectedAgent = discovery.agents.find((agent) => agent.name === liveRecord.agentType);
+			const selectedAgent = discovery.agents.find(
+				(agent) => agent.name === liveRecord.agentType,
+			);
 			if (!selectedAgent) {
 				return {
-					content: [{ type: "text", text: `Team member "${member.name}" refers to unavailable agent type "${liveRecord.agentType}".` }],
-					details: { to: target, agentType: liveRecord.agentType, delivery: "queued", teamName: activeTeamName },
+					content: [
+						{
+							type: "text",
+							text: `Team member "${member.name}" refers to unavailable agent type "${liveRecord.agentType}".`,
+						},
+					],
+					details: {
+						to: target,
+						agentType: liveRecord.agentType,
+						delivery: "queued",
+						teamName: activeTeamName,
+					},
 					isError: true,
 				};
 			}
@@ -1661,8 +2367,8 @@ async function executeSendMessageTool(
 				agent: selectedAgent,
 				message: messageText,
 				summary,
-				defaultCwd: ctx.cwd,
-				requestedCwd: liveRecord.cwd,
+				defaultCwd: liveRecord.cwd,
+				sessionCwd: ctx.cwd,
 				modelRegistry: ctx.modelRegistry,
 				currentModel: ctx.model,
 				modelOverride: liveRecord.model,
@@ -1671,7 +2377,10 @@ async function executeSendMessageTool(
 					cwd: ctx.cwd,
 					teamName: activeTeamName,
 					actingAgentName: liveRecord.name,
-					runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+					runtimeContext: {
+						modelRegistry: ctx.modelRegistry,
+						currentModel: ctx.model,
+					},
 				}),
 			});
 			recipients.push(liveRecord.name);
@@ -1679,25 +2388,51 @@ async function executeSendMessageTool(
 
 		if (recipients.length === 0) {
 			return {
-				content: [{ type: "text", text: `Team "${activeTeamName}" has no live teammates in this Pi session. Relaunch them with Agent(team_name + name) first.` }],
-				details: { to: target, agentType: "team", delivery: "queued", teamName: activeTeamName, recipients: [] },
+				content: [
+					{
+						type: "text",
+						text: `Team "${activeTeamName}" has no live teammates in this Pi session. Relaunch them with Agent(team_name + name) first.`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: "team",
+					delivery: "queued",
+					teamName: activeTeamName,
+					recipients: [],
+				},
 				isError: true,
 			};
 		}
 
 		return {
-			content: [{
-				type: "text",
-				text: `Broadcast delivered to ${recipients.length} teammate(s) in team "${activeTeamName}".`,
-			}],
-			details: { to: target, agentType: "team", delivery: "queued", teamName: activeTeamName, recipients },
+			content: [
+				{
+					type: "text",
+					text: `Broadcast delivered to ${recipients.length} teammate(s) in team "${activeTeamName}".`,
+				},
+			],
+			details: {
+				to: target,
+				agentType: "team",
+				delivery: "queued",
+				teamName: activeTeamName,
+				recipients,
+			},
 		};
 	}
 
 	if (activeTeamName && activeTeam && activeTeam.members[target]) {
 		const member = activeTeam.members[target];
-		const liveRecord = runtimeManager.get(target, { kind: "teammate", teamName: activeTeamName });
-		const detachedTeammateTask = getDetachedManagedRuntimeTask(target, "teammate", activeTeamName);
+		const liveRecord = runtimeManager.get(target, {
+			kind: "teammate",
+			teamName: activeTeamName,
+		});
+		const detachedTeammateTask = getDetachedManagedRuntimeTask(
+			target,
+			"teammate",
+			activeTeamName,
+		);
 		if (!liveRecord) {
 			if (detachedTeammateTask?.status === "running") {
 				const pendingCount = await queueDetachedBackgroundMessage({
@@ -1709,21 +2444,55 @@ async function executeSendMessageTool(
 					summary,
 				});
 				return {
-					content: [{ type: "text", text: `Message queued for detached teammate "${target}". Pending messages: ${pendingCount}.` }],
-					details: { to: target, agentType: member.agentType, delivery: "queued", kind: "teammate", teamName: activeTeamName, pendingCount },
+					content: [
+						{
+							type: "text",
+							text: `Message queued for detached teammate "${target}". Pending messages: ${pendingCount}.`,
+						},
+					],
+					details: {
+						to: target,
+						agentType: member.agentType,
+						delivery: "queued",
+						kind: "teammate",
+						teamName: activeTeamName,
+						pendingCount,
+					},
 				};
 			}
 			if (detachedTeammateTask) {
-				const selectedAgent = discovery.agents.find((agent) => agent.name === member.agentType);
+				const selectedAgent = discovery.agents.find(
+					(agent) => agent.name === member.agentType,
+				);
 				if (!selectedAgent) {
 					return {
-						content: [{ type: "text", text: `Teammate "${target}" refers to unavailable agent type "${member.agentType}".` }],
-						details: { to: target, agentType: member.agentType, delivery: "queued", kind: "teammate", teamName: activeTeamName },
+						content: [
+							{
+								type: "text",
+								text: `Teammate "${target}" refers to unavailable agent type "${member.agentType}".`,
+							},
+						],
+						details: {
+							to: target,
+							agentType: member.agentType,
+							delivery: "queued",
+							kind: "teammate",
+							teamName: activeTeamName,
+						},
 						isError: true,
 					};
 				}
+				await ensureAgentIsolationReady({
+					stateCwd: ctx.cwd,
+					baseCwd: ctx.cwd,
+					agent: selectedAgent,
+					logicalName: target,
+					kind: "teammate",
+					teamName: activeTeamName,
+				});
 				const relaunched = await launchDetachedBackgroundRun({
-					cwd: ctx.cwd,
+					stateCwd: ctx.cwd,
+					runtimeCwd: member.cwd,
 					getSessionDir: getNamedAgentSessionDir,
 					name: target,
 					kind: "teammate",
@@ -1734,44 +2503,115 @@ async function executeSendMessageTool(
 					currentModel: currentModelLabel,
 					modelOverride: member.model,
 					permissions: {
-						...(member.allowedTools ? { allowedTools: member.allowedTools } : {}),
-						...(member.disallowedTools ? { disallowedTools: member.disallowedTools } : {}),
-						...(member.allowedDirectories ? { allowedDirectories: member.allowedDirectories } : {}),
-						...(member.allowedSkills ? { allowedSkills: member.allowedSkills } : {}),
-						...(member.disallowedSkills ? { disallowedSkills: member.disallowedSkills } : {}),
-						...(member.permissionMode ? { permissionMode: member.permissionMode } : {}),
+						...(member.allowedTools
+							? { allowedTools: member.allowedTools }
+							: {}),
+						...(member.disallowedTools
+							? { disallowedTools: member.disallowedTools }
+							: {}),
+						...(member.allowedDirectories
+							? { allowedDirectories: member.allowedDirectories }
+							: {}),
+						...(member.allowedSkills
+							? { allowedSkills: member.allowedSkills }
+							: {}),
+						...(member.disallowedSkills
+							? { disallowedSkills: member.disallowedSkills }
+							: {}),
+						...(member.permissionMode
+							? { permissionMode: member.permissionMode }
+							: {}),
 					},
 					persisted: toManagedTeammateRecord(activeTeamName, member),
-					managedPlanModeInitialReason: member.permissionMode === "plan" ? member.lastDescription : undefined,
+					managedPlanModeInitialReason:
+						member.permissionMode === "plan"
+							? (summary ?? `Follow-up for ${target}`)
+							: undefined,
 					managedTaskRegistry,
 				});
-				await saveTeamRecord(ctx.cwd, upsertTeamMember(activeTeam, toTeamMemberRecord(relaunched)));
+				await saveTeamRecord(
+					ctx.cwd,
+					upsertTeamMember(activeTeam, toTeamMemberRecord(relaunched)),
+				);
 				return {
-					content: [{ type: "text", text: `Detached teammate "${target}" was ${detachedTeammateTask.status}; relaunched with your message.` }],
-					details: { to: target, agentType: member.agentType, delivery: "resumed", kind: "teammate", teamName: activeTeamName, previousStatus: detachedTeammateTask.status },
+					content: [
+						{
+							type: "text",
+							text: `Detached teammate "${target}" was ${detachedTeammateTask.status}; relaunched with your message.`,
+						},
+					],
+					details: {
+						to: target,
+						agentType: member.agentType,
+						delivery: "resumed",
+						kind: "teammate",
+						teamName: activeTeamName,
+						previousStatus: detachedTeammateTask.status,
+					},
 				};
 			}
 			await removeTeammateMember(ctx.cwd, activeTeamName, target);
 			return {
-				content: [{ type: "text", text: `Teammate "${target}" is not live in this Pi session anymore. Launch it again with Agent(team_name + name) before using SendMessage.` }],
-				details: { to: target, agentType: member.agentType, delivery: "queued", kind: "teammate", teamName: activeTeamName },
+				content: [
+					{
+						type: "text",
+						text: `Teammate "${target}" is not live in this Pi session anymore. Launch it again with Agent(team_name + name) before using SendMessage.`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: member.agentType,
+					delivery: "queued",
+					kind: "teammate",
+					teamName: activeTeamName,
+				},
 				isError: true,
 			};
 		}
 
 		if (shutdownRequest) {
-			await stopManagedRuntime(target, { kind: "teammate", teamName: activeTeamName });
+			await stopManagedRuntime(target, {
+				kind: "teammate",
+				teamName: activeTeamName,
+			});
 			return {
-				content: [{ type: "text", text: `Shutdown requested for teammate "${target}".` }],
-				details: { to: target, agentType: liveRecord.agentType, delivery: "stopped", kind: "teammate", teamName: activeTeamName, previousStatus: liveRecord.status, requestId: shutdownRequest.request_id, messageType: shutdownRequest.type },
+				content: [
+					{
+						type: "text",
+						text: `Shutdown requested for teammate "${target}".`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: liveRecord.agentType,
+					delivery: "stopped",
+					kind: "teammate",
+					teamName: activeTeamName,
+					previousStatus: liveRecord.status,
+					requestId: shutdownRequest.request_id,
+					messageType: shutdownRequest.type,
+				},
 			};
 		}
 
-		const selectedAgent = discovery.agents.find((agent) => agent.name === liveRecord.agentType);
+		const selectedAgent = discovery.agents.find(
+			(agent) => agent.name === liveRecord.agentType,
+		);
 		if (!selectedAgent) {
 			return {
-				content: [{ type: "text", text: `Teammate "${target}" refers to unavailable agent type "${liveRecord.agentType}".` }],
-				details: { to: target, agentType: liveRecord.agentType, delivery: "queued", kind: "teammate", teamName: activeTeamName },
+				content: [
+					{
+						type: "text",
+						text: `Teammate "${target}" refers to unavailable agent type "${liveRecord.agentType}".`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: liveRecord.agentType,
+					delivery: "queued",
+					kind: "teammate",
+					teamName: activeTeamName,
+				},
 				isError: true,
 			};
 		}
@@ -1785,8 +2625,8 @@ async function executeSendMessageTool(
 				agent: selectedAgent,
 				message: messageText,
 				summary,
-				defaultCwd: ctx.cwd,
-				requestedCwd: liveRecord.cwd,
+				defaultCwd: liveRecord.cwd,
+				sessionCwd: ctx.cwd,
 				modelRegistry: ctx.modelRegistry,
 				currentModel: ctx.model,
 				modelOverride: liveRecord.model,
@@ -1795,33 +2635,72 @@ async function executeSendMessageTool(
 					cwd: ctx.cwd,
 					teamName: activeTeamName,
 					actingAgentName: liveRecord.name,
-					runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+					runtimeContext: {
+						modelRegistry: ctx.modelRegistry,
+						currentModel: ctx.model,
+					},
 				}),
 			});
 
 			if (delivery.delivery === "queued") {
-				const pendingSuffix = delivery.pendingCount ? ` Pending messages: ${delivery.pendingCount}.` : "";
+				const pendingSuffix = delivery.pendingCount
+					? ` Pending messages: ${delivery.pendingCount}.`
+					: "";
 				return {
-					content: [{ type: "text", text: `Message queued for teammate "${target}".${pendingSuffix}` }],
-					details: { to: target, agentType: selectedAgent.name, delivery: "queued", kind: "teammate", teamName: activeTeamName, ...(delivery.pendingCount ? { pendingCount: delivery.pendingCount } : {}) },
+					content: [
+						{
+							type: "text",
+							text: `Message queued for teammate "${target}".${pendingSuffix}`,
+						},
+					],
+					details: {
+						to: target,
+						agentType: selectedAgent.name,
+						delivery: "queued",
+						kind: "teammate",
+						teamName: activeTeamName,
+						...(delivery.pendingCount
+							? { pendingCount: delivery.pendingCount }
+							: {}),
+					},
 				};
 			}
 
 			return {
-				content: [{ type: "text", text: `Teammate "${target}" was ${delivery.previousStatus ?? "idle"}; resumed it in the background with your message.` }],
-				details: { to: target, agentType: selectedAgent.name, delivery: "resumed", kind: "teammate", teamName: activeTeamName, previousStatus: delivery.previousStatus },
+				content: [
+					{
+						type: "text",
+						text: `Teammate "${target}" was ${delivery.previousStatus ?? "idle"}; resumed it in the background with your message.`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: selectedAgent.name,
+					delivery: "resumed",
+					kind: "teammate",
+					teamName: activeTeamName,
+					previousStatus: delivery.previousStatus,
+				},
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return {
 				content: [{ type: "text", text: `SendMessage failed: ${message}` }],
-				details: { to: target, agentType: liveRecord.agentType, delivery: "queued", kind: "teammate", teamName: activeTeamName },
+				details: {
+					to: target,
+					agentType: liveRecord.agentType,
+					delivery: "queued",
+					kind: "teammate",
+					teamName: activeTeamName,
+				},
 				isError: true,
 			};
 		}
 	}
 
-	const namedRecord = runtimeManager.get(target, { kind: "subagent" }) ?? namedAgentState.agents[target];
+	const namedRecord =
+		runtimeManager.get(target, { kind: "subagent" }) ??
+		namedAgentState.agents[target];
 	if (!namedRecord) {
 		return {
 			content: [{ type: "text", text: `Unknown named agent "${target}".` }],
@@ -1833,25 +2712,50 @@ async function executeSendMessageTool(
 	if (shutdownRequest) {
 		await stopManagedRuntime(target, { kind: "subagent" });
 		return {
-			content: [{ type: "text", text: `Shutdown requested for agent "${target}".` }],
-			details: { to: target, agentType: namedRecord.agentType, delivery: "stopped", kind: "subagent", previousStatus: namedRecord.status, requestId: shutdownRequest.request_id, messageType: shutdownRequest.type },
+			content: [
+				{ type: "text", text: `Shutdown requested for agent "${target}".` },
+			],
+			details: {
+				to: target,
+				agentType: namedRecord.agentType,
+				delivery: "stopped",
+				kind: "subagent",
+				previousStatus: namedRecord.status,
+				requestId: shutdownRequest.request_id,
+				messageType: shutdownRequest.type,
+			},
 		};
 	}
 
-	const selectedAgent = discovery.agents.find((agent) => agent.name === namedRecord.agentType);
+	const selectedAgent = discovery.agents.find(
+		(agent) => agent.name === namedRecord.agentType,
+	);
 	if (!selectedAgent) {
 		return {
-			content: [{
-				type: "text",
-				text: `Named agent "${target}" is bound to agent type "${namedRecord.agentType}", but that agent definition is not currently available.`,
-			}],
-			details: { to: target, agentType: namedRecord.agentType, delivery: "queued", kind: "subagent" },
+			content: [
+				{
+					type: "text",
+					text: `Named agent "${target}" is bound to agent type "${namedRecord.agentType}", but that agent definition is not currently available.`,
+				},
+			],
+			details: {
+				to: target,
+				agentType: namedRecord.agentType,
+				delivery: "queued",
+				kind: "subagent",
+			},
 			isError: true,
 		};
 	}
 
-	const detachedSubagentTask = getDetachedManagedSubagentTask(target);
-	if (!runtimeManager.get(target, { kind: "subagent" }) && detachedSubagentTask?.status === "running") {
+	const detachedSubagentTask = getDetachedManagedRuntimeTask(
+		target,
+		"subagent",
+	);
+	if (
+		!runtimeManager.get(target, { kind: "subagent" }) &&
+		detachedSubagentTask?.status === "running"
+	) {
 		const pendingCount = await queueDetachedBackgroundMessage({
 			cwd: ctx.cwd,
 			name: target,
@@ -1860,32 +2764,72 @@ async function executeSendMessageTool(
 			summary,
 		});
 		return {
-			content: [{ type: "text", text: `Message queued for detached background agent "${target}". Pending messages: ${pendingCount}.` }],
-			details: { to: target, agentType: namedRecord.agentType, delivery: "queued", kind: "subagent", pendingCount },
+			content: [
+				{
+					type: "text",
+					text: `Message queued for detached background agent "${target}". Pending messages: ${pendingCount}.`,
+				},
+			],
+			details: {
+				to: target,
+				agentType: namedRecord.agentType,
+				delivery: "queued",
+				kind: "subagent",
+				pendingCount,
+			},
 		};
 	}
 
-	if (!runtimeManager.get(target, { kind: "subagent" }) && detachedSubagentTask && detachedSubagentTask.status !== "running") {
+	if (
+		!runtimeManager.get(target, { kind: "subagent" }) &&
+		detachedSubagentTask &&
+		detachedSubagentTask.status !== "running"
+	) {
+		await ensureAgentIsolationReady({
+			stateCwd: ctx.cwd,
+			baseCwd: ctx.cwd,
+			agent: selectedAgent,
+			logicalName: target,
+			kind: "subagent",
+		});
 		const resumed = await launchDetachedBackgroundRun({
-			cwd: ctx.cwd,
+			stateCwd: ctx.cwd,
+			runtimeCwd: namedRecord.cwd,
 			getSessionDir: getNamedAgentSessionDir,
 			name: target,
 			kind: "subagent",
 			agent: selectedAgent,
 			task: messageText,
 			description: summary ?? `Follow-up for ${target}`,
-			currentModel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			currentModel: ctx.model
+				? `${ctx.model.provider}/${ctx.model.id}`
+				: undefined,
 			modelOverride: namedRecord.model,
 			permissions: {
-				...(namedRecord.allowedTools ? { allowedTools: namedRecord.allowedTools } : {}),
-				...(namedRecord.disallowedTools ? { disallowedTools: namedRecord.disallowedTools } : {}),
-				...(namedRecord.allowedDirectories ? { allowedDirectories: namedRecord.allowedDirectories } : {}),
-				...(namedRecord.allowedSkills ? { allowedSkills: namedRecord.allowedSkills } : {}),
-				...(namedRecord.disallowedSkills ? { disallowedSkills: namedRecord.disallowedSkills } : {}),
-				...(namedRecord.permissionMode ? { permissionMode: namedRecord.permissionMode } : {}),
+				...(namedRecord.allowedTools
+					? { allowedTools: namedRecord.allowedTools }
+					: {}),
+				...(namedRecord.disallowedTools
+					? { disallowedTools: namedRecord.disallowedTools }
+					: {}),
+				...(namedRecord.allowedDirectories
+					? { allowedDirectories: namedRecord.allowedDirectories }
+					: {}),
+				...(namedRecord.allowedSkills
+					? { allowedSkills: namedRecord.allowedSkills }
+					: {}),
+				...(namedRecord.disallowedSkills
+					? { disallowedSkills: namedRecord.disallowedSkills }
+					: {}),
+				...(namedRecord.permissionMode
+					? { permissionMode: namedRecord.permissionMode }
+					: {}),
 			},
 			persisted: namedRecord,
-			managedPlanModeInitialReason: namedRecord.permissionMode === "plan" ? namedRecord.lastDescription : undefined,
+			managedPlanModeInitialReason:
+				namedRecord.permissionMode === "plan"
+					? namedRecord.lastDescription
+					: undefined,
 			managedTaskRegistry,
 		});
 		namedAgentState = {
@@ -1897,8 +2841,19 @@ async function executeSendMessageTool(
 		};
 		await persistNamedAgentState();
 		return {
-			content: [{ type: "text", text: `Detached background agent "${target}" was ${detachedSubagentTask.status}; relaunched with your follow-up message.` }],
-			details: { to: target, agentType: namedRecord.agentType, delivery: "resumed", kind: "subagent", previousStatus: detachedSubagentTask.status },
+			content: [
+				{
+					type: "text",
+					text: `Detached background agent "${target}" was ${detachedSubagentTask.status}; relaunched with your follow-up message.`,
+				},
+			],
+			details: {
+				to: target,
+				agentType: namedRecord.agentType,
+				delivery: "resumed",
+				kind: "subagent",
+				previousStatus: detachedSubagentTask.status,
+			},
 		};
 	}
 
@@ -1909,8 +2864,8 @@ async function executeSendMessageTool(
 			agent: selectedAgent,
 			message: messageText,
 			summary,
-			defaultCwd: ctx.cwd,
-			requestedCwd: namedRecord.cwd,
+			defaultCwd: namedRecord.cwd,
+			sessionCwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			currentModel: ctx.model,
 			modelOverride: namedRecord.model,
@@ -1918,27 +2873,61 @@ async function executeSendMessageTool(
 			customTools: buildNamedSubagentRuntimeCustomTools({
 				cwd: ctx.cwd,
 				actingAgentName: target,
-				runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+				runtimeContext: {
+					modelRegistry: ctx.modelRegistry,
+					currentModel: ctx.model,
+				},
 			}),
 		});
 
 		if (delivery.delivery === "queued") {
-			const pendingSuffix = delivery.pendingCount ? ` Pending messages: ${delivery.pendingCount}.` : "";
+			const pendingSuffix = delivery.pendingCount
+				? ` Pending messages: ${delivery.pendingCount}.`
+				: "";
 			return {
-				content: [{ type: "text", text: `Message queued for delivery to "${target}" at its next tool round.${pendingSuffix}` }],
-				details: { to: target, agentType: selectedAgent.name, delivery: "queued", kind: "subagent", ...(delivery.pendingCount ? { pendingCount: delivery.pendingCount } : {}) },
+				content: [
+					{
+						type: "text",
+						text: `Message queued for delivery to "${target}" at its next tool round.${pendingSuffix}`,
+					},
+				],
+				details: {
+					to: target,
+					agentType: selectedAgent.name,
+					delivery: "queued",
+					kind: "subagent",
+					...(delivery.pendingCount
+						? { pendingCount: delivery.pendingCount }
+						: {}),
+				},
 			};
 		}
 
 		return {
-			content: [{ type: "text", text: `Agent "${target}" was ${delivery.previousStatus ?? "idle"}; resumed it in the background with your message. You'll be notified when it finishes.` }],
-			details: { to: target, agentType: selectedAgent.name, delivery: "resumed", kind: "subagent", previousStatus: delivery.previousStatus },
+			content: [
+				{
+					type: "text",
+					text: `Agent "${target}" was ${delivery.previousStatus ?? "idle"}; resumed it in the background with your message. You'll be notified when it finishes.`,
+				},
+			],
+			details: {
+				to: target,
+				agentType: selectedAgent.name,
+				delivery: "resumed",
+				kind: "subagent",
+				previousStatus: delivery.previousStatus,
+			},
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return {
 			content: [{ type: "text", text: `SendMessage failed: ${message}` }],
-			details: { to: target, agentType: namedRecord.agentType, delivery: "queued", kind: "subagent" },
+			details: {
+				to: target,
+				agentType: namedRecord.agentType,
+				delivery: "queued",
+				kind: "subagent",
+			},
 			isError: true,
 		};
 	}
@@ -1971,21 +2960,41 @@ async function executeClaudeAgentTool(
 		activeTeamState = diskTeamState;
 	}
 
-	const subagentRecord = logicalName ? runtimeManager?.get(logicalName, { kind: "subagent" }) ?? namedAgentState.agents[logicalName] : undefined;
-	if (subagentRecord && params.subagent_type?.trim() && params.subagent_type.trim() !== subagentRecord.agentType) {
+	const subagentRecord = logicalName
+		? (runtimeManager?.get(logicalName, { kind: "subagent" }) ??
+			namedAgentState.agents[logicalName])
+		: undefined;
+	if (
+		subagentRecord &&
+		params.subagent_type?.trim() &&
+		params.subagent_type.trim() !== subagentRecord.agentType
+	) {
 		return {
-			content: [{ type: "text", text: `Named agent "${logicalName}" is already bound to agent type "${subagentRecord.agentType}". Use the same subagent_type or choose a different name.` }],
+			content: [
+				{
+					type: "text",
+					text: `Named agent "${logicalName}" is already bound to agent type "${subagentRecord.agentType}". Use the same subagent_type or choose a different name.`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
 
-	const agentName = params.subagent_type?.trim() || subagentRecord?.agentType || "general-purpose";
+	const agentName =
+		params.subagent_type?.trim() ||
+		subagentRecord?.agentType ||
+		"general-purpose";
 	const selectedAgent = agents.find((agent) => agent.name === agentName);
 	if (!selectedAgent) {
 		const available = agents.map((agent) => agent.name).join(", ") || "none";
 		return {
-			content: [{ type: "text", text: `Unknown agent type "${agentName}". Available agents: ${available}` }],
+			content: [
+				{
+					type: "text",
+					text: `Unknown agent type "${agentName}". Available agents: ${available}`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
@@ -2002,71 +3011,98 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 		);
 		if (!ok) {
 			return {
-				content: [{ type: "text", text: "Canceled: project-local agent not approved." }],
+				content: [
+					{ type: "text", text: "Canceled: project-local agent not approved." },
+				],
 				details: makeDetails([]),
 			};
 		}
 	}
 
 	const requestedPermissionModeRaw = params.mode?.trim();
-	const requestedPermissionMode = requestedPermissionModeRaw ? parseAgentPermissionMode(requestedPermissionModeRaw) : undefined;
+	const requestedPermissionMode = requestedPermissionModeRaw
+		? parseAgentPermissionMode(requestedPermissionModeRaw)
+		: undefined;
 	if (requestedPermissionModeRaw && !requestedPermissionMode) {
 		return {
-			content: [{ type: "text", text: `Unknown permission mode "${requestedPermissionModeRaw}".` }],
+			content: [
+				{
+					type: "text",
+					text: `Unknown permission mode "${requestedPermissionModeRaw}".`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
-	const effectiveAgent = requestedPermissionMode ? { ...selectedAgent, permissionMode: requestedPermissionMode } : selectedAgent;
+	const effectiveAgent = requestedPermissionMode
+		? { ...selectedAgent, permissionMode: requestedPermissionMode }
+		: selectedAgent;
 	const modelOverride = params.model?.trim() || undefined;
-	const currentModelLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	const currentModelLabel = ctx.model
+		? `${ctx.model.provider}/${ctx.model.id}`
+		: undefined;
 	const requestedCwd = params.cwd?.trim() || undefined;
-	const effectiveCwdForPermissions = requestedCwd ?? ctx.cwd;
-	let permissionConfig = mergePermissionConfig(effectiveAgent, {
+	const baseRequestedCwd = requestedCwd
+		? path.resolve(ctx.cwd, requestedCwd)
+		: ctx.cwd;
+	const permissionOverrides: AgentPermissionConfig = {
 		allowedTools: params.allowed_tools,
 		disallowedTools: params.disallowed_tools,
 		allowedDirectories: params.allowed_directories,
 		allowedSkills: params.allowed_skills,
 		disallowedSkills: params.disallowed_skills,
-	});
-	if (effectiveAgent.memory && permissionConfig.allowedDirectories) {
-		const memoryDir = getAgentMemoryDir(path.resolve(effectiveCwdForPermissions), effectiveAgent.name, effectiveAgent.memory);
-		permissionConfig = {
-			...permissionConfig,
-			allowedDirectories: [...new Set([...permissionConfig.allowedDirectories, memoryDir])],
-		};
-	}
-	const runtimeProfile = ManagedRuntimeProfile.fromAgent(effectiveAgent, permissionConfig);
-	const allowedDirectories = resolveAllowedDirectories(effectiveCwdForPermissions, permissionConfig);
-	if (requestedCwd && allowedDirectories && !allowedDirectories.some((dir) => {
-		const resolvedRequested = path.resolve(requestedCwd);
-		const resolvedDir = path.resolve(dir);
-		return resolvedRequested === resolvedDir || resolvedRequested.startsWith(`${resolvedDir}${path.sep}`);
-	})) {
-		return {
-			content: [{ type: "text", text: `Requested cwd \"${requestedCwd}\" is outside the agent's allowed_directories profile.` }],
-			details: makeDetails([]),
-			isError: true,
-		};
-	}
-	const effectiveBackground = params.run_in_background === true || effectiveAgent.background === true;
+	};
+	const effectiveBackground =
+		params.run_in_background === true || effectiveAgent.background === true;
 	if (effectiveAgent.permissionMode === "plan" && !logicalName) {
 		return {
-			content: [{ type: "text", text: "Agents with permissionMode=plan currently require name so the managed child runtime can request approval and later resume execution." }],
+			content: [
+				{
+					type: "text",
+					text: "Agents with permissionMode=plan currently require name so the managed child runtime can request approval and later resume execution.",
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
-	if (effectiveAgent.isolation) {
+	if (effectiveAgent.isolation === "remote") {
 		return {
-			content: [{ type: "text", text: `Agent isolation "${effectiveAgent.isolation}" is declared for "${effectiveAgent.name}", but pi-claude-subagent does not support isolated runtimes yet.` }],
+			content: [
+				{
+					type: "text",
+					text: `Agent isolation "${effectiveAgent.isolation}" is declared for "${effectiveAgent.name}", but pi-claude-subagent does not support remote isolated runtimes yet.`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
-	if ((effectiveAgent.mcpServers && effectiveAgent.mcpServers.length > 0) || (effectiveAgent.requiredMcpServers && effectiveAgent.requiredMcpServers.length > 0)) {
+	if (effectiveAgent.isolation === "worktree" && !logicalName) {
 		return {
-			content: [{ type: "text", text: `Agent-level MCP server requirements are declared for "${effectiveAgent.name}", but launch-time MCP provisioning is not implemented yet in pi-claude-subagent.` }],
+			content: [
+				{
+					type: "text",
+					text: `Agent isolation "${effectiveAgent.isolation}" for "${effectiveAgent.name}" currently requires name so the runtime can keep a stable worktree.`,
+				},
+			],
+			details: makeDetails([]),
+			isError: true,
+		};
+	}
+	if (
+		(effectiveAgent.mcpServers && effectiveAgent.mcpServers.length > 0) ||
+		(effectiveAgent.requiredMcpServers &&
+			effectiveAgent.requiredMcpServers.length > 0)
+	) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Agent-level MCP server requirements are declared for "${effectiveAgent.name}", but launch-time MCP provisioning is not implemented yet in pi-claude-subagent.`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
@@ -2075,7 +3111,12 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 	if (explicitTeamName) {
 		if (!logicalName) {
 			return {
-				content: [{ type: "text", text: "team_name requires name so the teammate can be addressed later." }],
+				content: [
+					{
+						type: "text",
+						text: "team_name requires name so the teammate can be addressed later.",
+					},
+				],
 				details: makeDetails([]),
 				isError: true,
 			};
@@ -2084,7 +3125,12 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 		const team = await loadTeamRecord(ctx.cwd, explicitTeamName);
 		if (!team) {
 			return {
-				content: [{ type: "text", text: `Team "${explicitTeamName}" does not exist yet. Use TeamCreate first.` }],
+				content: [
+					{
+						type: "text",
+						text: `Team "${explicitTeamName}" does not exist yet. Use TeamCreate first.`,
+					},
+				],
 				details: makeDetails([]),
 				isError: true,
 			};
@@ -2092,36 +3138,95 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 		activeTeamState = { teamName: team.name };
 		await persistActiveTeamState();
 
-		const liveTeammate = runtimeManager?.get(logicalName, { kind: "teammate", teamName: team.name });
-		if (!liveTeammate && team.members[logicalName] && !getDetachedManagedRuntimeTask(logicalName, "teammate", team.name)) {
+		const liveTeammate = runtimeManager?.get(logicalName, {
+			kind: "teammate",
+			teamName: team.name,
+		});
+		if (
+			!liveTeammate &&
+			team.members[logicalName] &&
+			!getDetachedManagedRuntimeTask(logicalName, "teammate", team.name)
+		) {
 			await removeTeammateMember(ctx.cwd, team.name, logicalName);
 		}
 
 		const persistedTeammate = liveTeammate;
-		if (persistedTeammate && requestedCwd && requestedCwd !== persistedTeammate.cwd) {
+		const resolvedTeammateCwd = await resolveAgentExecutionCwd({
+			stateCwd: ctx.cwd,
+			baseCwd: baseRequestedCwd,
+			agent: effectiveAgent,
+			logicalName,
+			kind: "teammate",
+			teamName: team.name,
+		});
+		const desiredTeammateCwd = persistedTeammate?.cwd ?? resolvedTeammateCwd;
+		const permissionConfig = buildRuntimePermissionConfig(
+			effectiveAgent,
+			permissionOverrides,
+			desiredTeammateCwd,
+		);
+		const runtimeProfile = ManagedRuntimeProfile.fromAgent(
+			effectiveAgent,
+			permissionConfig,
+		);
+		const allowedDirectories = resolveAllowedDirectories(
+			desiredTeammateCwd,
+			permissionConfig,
+		);
+		if (
+			requestedCwd &&
+			!isRequestedCwdAllowed(resolvedTeammateCwd, allowedDirectories)
+		) {
 			return {
-				content: [{ type: "text", text: `Teammate "${logicalName}" is already bound to cwd "${persistedTeammate.cwd}". Use the same cwd or choose a different name.` }],
+				content: [
+					{
+						type: "text",
+						text: `Requested cwd "${requestedCwd}" is outside the agent's allowed_directories profile.`,
+					},
+				],
 				details: makeDetails([]),
 				isError: true,
 			};
 		}
-		if (persistedTeammate) {
-			if (!runtimeProfile.matchesRecord(persistedTeammate)) {
-				return {
-					content: [{ type: "text", text: `Teammate "${logicalName}" is already bound to a different runtime profile. Use the same profile or choose a different name.` }],
-					details: makeDetails([]),
-					isError: true,
-				};
-			}
+		if (
+			persistedTeammate &&
+			requestedCwd &&
+			!sameResolvedPath(resolvedTeammateCwd, persistedTeammate.cwd)
+		) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Teammate "${logicalName}" is already bound to cwd "${persistedTeammate.cwd}". Use the same cwd or choose a different name.`,
+					},
+				],
+				details: makeDetails([]),
+				isError: true,
+			};
+		}
+		if (persistedTeammate && !runtimeProfile.matchesRecord(persistedTeammate)) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Teammate "${logicalName}" is already bound to a different runtime profile. Use the same profile or choose a different name.`,
+					},
+				],
+				details: makeDetails([]),
+				isError: true,
+			};
 		}
 
 		if (!runtimeManager) {
 			throw new Error("Agent runtime manager is not initialized.");
 		}
 
-		if (supportsDetachedBackgroundRun({ kind: "teammate", teamName: team.name })) {
+		if (
+			supportsDetachedBackgroundRun({ kind: "teammate", teamName: team.name })
+		) {
 			const launched = await launchDetachedBackgroundRun({
-				cwd: ctx.cwd,
+				stateCwd: ctx.cwd,
+				runtimeCwd: desiredTeammateCwd,
 				getSessionDir: getNamedAgentSessionDir,
 				name: logicalName,
 				kind: "teammate",
@@ -2133,13 +3238,26 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 				modelOverride: modelOverride ?? persistedTeammate?.model,
 				permissions: permissionConfig,
 				persisted: persistedTeammate,
-				managedPlanModeInitialReason: effectiveAgent.permissionMode === "plan" ? params.description : undefined,
+				managedPlanModeInitialReason:
+					effectiveAgent.permissionMode === "plan"
+						? params.description
+						: undefined,
 				managedTaskRegistry,
 			});
-			await saveTeamRecord(ctx.cwd, upsertTeamMember(team, toTeamMemberRecord(launched)));
+			await saveTeamRecord(
+				ctx.cwd,
+				upsertTeamMember(team, toTeamMemberRecord(launched)),
+			);
 			return {
-				content: [{ type: "text", text: `Detached teammate "${logicalName}" launched in team "${team.name}". It can continue after this Pi process exits.` }],
-				details: makeDetails([makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt)]),
+				content: [
+					{
+						type: "text",
+						text: `Detached teammate "${logicalName}" launched in team "${team.name}". It can continue after this Pi process exits.`,
+					},
+				],
+				details: makeDetails([
+					makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt),
+				]),
 			};
 		}
 
@@ -2157,60 +3275,124 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 			agent: effectiveAgent,
 			task: params.prompt,
 			description: params.description,
-			defaultCwd: ctx.cwd,
-			requestedCwd: persistedTeammate?.cwd ?? requestedCwd,
+			defaultCwd: desiredTeammateCwd,
+			sessionCwd: ctx.cwd,
 			modelRegistry: ctx.modelRegistry,
 			currentModel: ctx.model,
 			modelOverride: modelOverride ?? persistedTeammate?.model,
 			persisted: persistedTeammate,
-			managedPlanMode: effectiveAgent.permissionMode === "plan"
-				? createManagedPlanModeBridge({
-					name: logicalName,
-					kind: "teammate",
-					teamName: team.name,
-					reason: params.description,
-				})
-				: undefined,
+			managedPlanMode:
+				effectiveAgent.permissionMode === "plan"
+					? createManagedPlanModeBridge({
+							name: logicalName,
+							kind: "teammate",
+							teamName: team.name,
+							reason: params.description,
+						})
+					: undefined,
 			customTools: buildTeammateRuntimeCustomTools({
 				cwd: ctx.cwd,
 				teamName: team.name,
 				actingAgentName: logicalName,
-				runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+				runtimeContext: {
+					modelRegistry: ctx.modelRegistry,
+					currentModel: ctx.model,
+				},
 			}),
 		});
 
 		return {
-			content: [{ type: "text", text: `Teammate "${logicalName}" launched in team "${team.name}". You'll be notified when it completes.` }],
-			details: makeDetails([makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt)]),
+			content: [
+				{
+					type: "text",
+					text: `Teammate "${logicalName}" launched in team "${team.name}". You'll be notified when it completes.`,
+				},
+			],
+			details: makeDetails([
+				makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt),
+			]),
 		};
 	}
 
 	if (effectiveBackground && !logicalName) {
 		return {
-			content: [{ type: "text", text: "Background Agent calls currently require name so the child runtime can be tracked and resumed." }],
+			content: [
+				{
+					type: "text",
+					text: "Background Agent calls currently require name so the child runtime can be tracked and resumed.",
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
 
-	if (subagentRecord && requestedCwd && requestedCwd !== subagentRecord.cwd) {
+	const resolvedSubagentCwd = logicalName
+		? await resolveAgentExecutionCwd({
+				stateCwd: ctx.cwd,
+				baseCwd: baseRequestedCwd,
+				agent: effectiveAgent,
+				logicalName,
+				kind: "subagent",
+			})
+		: path.resolve(baseRequestedCwd);
+	const executionCwd = subagentRecord?.cwd ?? resolvedSubagentCwd;
+	const permissionConfig = buildRuntimePermissionConfig(
+		effectiveAgent,
+		permissionOverrides,
+		executionCwd,
+	);
+	const runtimeProfile = ManagedRuntimeProfile.fromAgent(
+		effectiveAgent,
+		permissionConfig,
+	);
+	const allowedDirectories = resolveAllowedDirectories(
+		executionCwd,
+		permissionConfig,
+	);
+	if (
+		requestedCwd &&
+		!isRequestedCwdAllowed(resolvedSubagentCwd, allowedDirectories)
+	) {
 		return {
-			content: [{ type: "text", text: `Named agent "${logicalName}" is already bound to cwd "${subagentRecord.cwd}". Use the same cwd or choose a different name.` }],
+			content: [
+				{
+					type: "text",
+					text: `Requested cwd "${requestedCwd}" is outside the agent's allowed_directories profile.`,
+				},
+			],
 			details: makeDetails([]),
 			isError: true,
 		};
 	}
-	if (subagentRecord) {
-		if (!runtimeProfile.matchesRecord(subagentRecord)) {
-			return {
-				content: [{ type: "text", text: `Named agent "${logicalName}" is already bound to a different runtime profile. Use the same profile or choose a different name.` }],
-				details: makeDetails([]),
-				isError: true,
-			};
-		}
+	if (
+		subagentRecord &&
+		requestedCwd &&
+		!sameResolvedPath(resolvedSubagentCwd, subagentRecord.cwd)
+	) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Named agent "${logicalName}" is already bound to cwd "${subagentRecord.cwd}". Use the same cwd or choose a different name.`,
+				},
+			],
+			details: makeDetails([]),
+			isError: true,
+		};
 	}
-
-	const executionCwd = subagentRecord?.cwd ?? requestedCwd ?? ctx.cwd;
+	if (subagentRecord && !runtimeProfile.matchesRecord(subagentRecord)) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: `Named agent "${logicalName}" is already bound to a different runtime profile. Use the same profile or choose a different name.`,
+				},
+			],
+			details: makeDetails([]),
+			isError: true,
+		};
+	}
 
 	try {
 		if (logicalName) {
@@ -2219,11 +3401,14 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 			}
 
 			if (effectiveBackground) {
-				if (supportsDetachedBackgroundRun({
-					kind: "subagent",
-				})) {
+				if (
+					supportsDetachedBackgroundRun({
+						kind: "subagent",
+					})
+				) {
 					const launched = await launchDetachedBackgroundRun({
-						cwd: ctx.cwd,
+						stateCwd: ctx.cwd,
+						runtimeCwd: executionCwd,
 						getSessionDir: getNamedAgentSessionDir,
 						name: logicalName,
 						kind: "subagent",
@@ -2234,7 +3419,10 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 						modelOverride,
 						permissions: permissionConfig,
 						persisted: subagentRecord,
-						managedPlanModeInitialReason: effectiveAgent.permissionMode === "plan" ? params.description : undefined,
+						managedPlanModeInitialReason:
+							effectiveAgent.permissionMode === "plan"
+								? params.description
+								: undefined,
 						managedTaskRegistry,
 					});
 					namedAgentState = {
@@ -2246,8 +3434,19 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 					};
 					await persistNamedAgentState();
 					return {
-						content: [{ type: "text", text: `Detached background agent "${logicalName}" launched. It can continue after this Pi process exits.` }],
-						details: makeDetails([makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt)]),
+						content: [
+							{
+								type: "text",
+								text: `Detached background agent "${logicalName}" launched. It can continue after this Pi process exits.`,
+							},
+						],
+						details: makeDetails([
+							makeBackgroundLaunchResult(
+								launched,
+								effectiveAgent,
+								params.prompt,
+							),
+						]),
 					};
 				}
 				const launched = await runtimeManager.launchBackground({
@@ -2261,28 +3460,39 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 					agent: effectiveAgent,
 					task: params.prompt,
 					description: params.description,
-					defaultCwd: ctx.cwd,
-					requestedCwd,
+					defaultCwd: executionCwd,
+					sessionCwd: ctx.cwd,
 					modelRegistry: ctx.modelRegistry,
 					currentModel: ctx.model,
-				modelOverride,
-				persisted: subagentRecord,
-				managedPlanMode: effectiveAgent.permissionMode === "plan"
-					? createManagedPlanModeBridge({
-						name: logicalName,
-						kind: "subagent",
-						reason: params.description,
-					})
-					: undefined,
-				customTools: buildNamedSubagentRuntimeCustomTools({
-					cwd: ctx.cwd,
+					modelOverride,
+					persisted: subagentRecord,
+					managedPlanMode:
+						effectiveAgent.permissionMode === "plan"
+							? createManagedPlanModeBridge({
+									name: logicalName,
+									kind: "subagent",
+									reason: params.description,
+								})
+							: undefined,
+					customTools: buildNamedSubagentRuntimeCustomTools({
+						cwd: ctx.cwd,
 						actingAgentName: logicalName,
-						runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+						runtimeContext: {
+							modelRegistry: ctx.modelRegistry,
+							currentModel: ctx.model,
+						},
 					}),
 				});
 				return {
-					content: [{ type: "text", text: `Background agent "${logicalName}" launched. You'll be notified when it completes.` }],
-					details: makeDetails([makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt)]),
+					content: [
+						{
+							type: "text",
+							text: `Background agent "${logicalName}" launched. You'll be notified when it completes.`,
+						},
+					],
+					details: makeDetails([
+						makeBackgroundLaunchResult(launched, effectiveAgent, params.prompt),
+					]),
 				};
 			}
 
@@ -2297,45 +3507,71 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 				agent: effectiveAgent,
 				task: params.prompt,
 				description: params.description,
-				defaultCwd: ctx.cwd,
-				requestedCwd,
+				defaultCwd: executionCwd,
+				sessionCwd: ctx.cwd,
 				modelRegistry: ctx.modelRegistry,
 				currentModel: ctx.model,
 				modelOverride,
 				signal,
 				persisted: subagentRecord,
-				managedPlanMode: effectiveAgent.permissionMode === "plan"
-					? createManagedPlanModeBridge({
-						name: logicalName,
-						kind: "subagent",
-						reason: params.description,
-					})
-					: undefined,
+				managedPlanMode:
+					effectiveAgent.permissionMode === "plan"
+						? createManagedPlanModeBridge({
+								name: logicalName,
+								kind: "subagent",
+								reason: params.description,
+							})
+						: undefined,
 				customTools: buildNamedSubagentRuntimeCustomTools({
 					cwd: ctx.cwd,
 					actingAgentName: logicalName,
-					runtimeContext: { modelRegistry: ctx.modelRegistry, currentModel: ctx.model },
+					runtimeContext: {
+						modelRegistry: ctx.modelRegistry,
+						currentModel: ctx.model,
+					},
 				}),
 				onUpdate: (partial) => {
 					onUpdate?.({
-						content: [{ type: "text", text: getFinalOutput(partial.messages) || "(running...)" }],
+						content: [
+							{
+								type: "text",
+								text: getFinalOutput(partial.messages) || "(running...)",
+							},
+						],
 						details: makeDetails([partial]),
 					});
 				},
 			});
 
-			const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+			const isError =
+				result.exitCode !== 0 ||
+				result.stopReason === "error" ||
+				result.stopReason === "aborted";
 			if (isError) {
-				const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+				const errorMsg =
+					result.errorMessage ||
+					result.stderr ||
+					getFinalOutput(result.messages) ||
+					"(no output)";
 				return {
-					content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+					content: [
+						{
+							type: "text",
+							text: `Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+						},
+					],
 					details: makeDetails([result]),
 					isError: true,
 				};
 			}
 
 			return {
-				content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+				content: [
+					{
+						type: "text",
+						text: getFinalOutput(result.messages) || "(no output)",
+					},
+				],
 				details: makeDetails([result]),
 			};
 		}
@@ -2351,24 +3587,46 @@ Project agents are repo-controlled. Only continue for trusted repositories.`,
 			signal,
 			onUpdate: (partial) => {
 				onUpdate?.({
-					content: [{ type: "text", text: getFinalOutput(partial.messages) || "(running...)" }],
+					content: [
+						{
+							type: "text",
+							text: getFinalOutput(partial.messages) || "(running...)",
+						},
+					],
 					details: makeDetails([partial]),
 				});
 			},
 		});
 
-		const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+		const isError =
+			result.exitCode !== 0 ||
+			result.stopReason === "error" ||
+			result.stopReason === "aborted";
 		if (isError) {
-			const errorMsg = result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+			const errorMsg =
+				result.errorMessage ||
+				result.stderr ||
+				getFinalOutput(result.messages) ||
+				"(no output)";
 			return {
-				content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+				content: [
+					{
+						type: "text",
+						text: `Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+					},
+				],
 				details: makeDetails([result]),
 				isError: true,
 			};
 		}
 
 		return {
-			content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+			content: [
+				{
+					type: "text",
+					text: getFinalOutput(result.messages) || "(no output)",
+				},
+			],
 			details: makeDetails([result]),
 		};
 	} catch (error) {
@@ -2392,16 +3650,23 @@ export default function (pi: ExtensionAPI) {
 		getSessionDir: getNamedAgentSessionDir,
 		hooks: {
 			onStateChange: async (record) => {
-				const taskEntry = managedTaskRegistry ? await managedTaskRegistry.upsertFromRecord(record) : undefined;
+				const taskEntry = managedTaskRegistry
+					? await managedTaskRegistry.upsertFromRecord(record)
+					: undefined;
 				if (taskEntry) {
-					pi.events.emit("claude-subagent:managed-task-changed", { ...taskEntry });
+					pi.events.emit("claude-subagent:managed-task-changed", {
+						...taskEntry,
+					});
 				}
-			if (record.kind === "teammate") {
-				await persistTeammateRecord(record);
-				pi.events.emit("claude-subagent:teammates-changed", { ...record });
-				if (record.status === "running" || record.autoClaimTasks !== true) {
-					clearTeammateAutoClaimPoller(record.name, record.teamName);
-					} else if (record.status === "completed" || record.status === "idle") {
+				if (record.kind === "teammate") {
+					await persistTeammateRecord(record);
+					pi.events.emit("claude-subagent:teammates-changed", { ...record });
+					if (record.status === "running" || record.autoClaimTasks !== true) {
+						clearTeammateAutoClaimPoller(record.name, record.teamName);
+					} else if (
+						record.status === "completed" ||
+						record.status === "idle"
+					) {
 						scheduleTeammateAutoClaim(record);
 					} else {
 						clearTeammateAutoClaimPoller(record.name, record.teamName);
@@ -2412,22 +3677,35 @@ export default function (pi: ExtensionAPI) {
 				await persistNamedAgentState();
 			},
 			onTerminal: async ({ record, result, wasBackground }) => {
-				const taskEntry = managedTaskRegistry ? await managedTaskRegistry.noteTerminal({ record, result, wasBackground }) : undefined;
+				const taskEntry = managedTaskRegistry
+					? await managedTaskRegistry.noteTerminal({
+							record,
+							result,
+							wasBackground,
+						})
+					: undefined;
 				if (taskEntry) {
-					pi.events.emit("claude-subagent:managed-task-changed", { ...taskEntry });
+					pi.events.emit("claude-subagent:managed-task-changed", {
+						...taskEntry,
+					});
 				}
 				let inferredTeamName = record.teamName;
 				if (!inferredTeamName && activeTeamState.teamName) {
-					const activeTeam = await loadTeamRecord(sessionRootCwd, activeTeamState.teamName);
+					const activeTeam = await loadTeamRecord(
+						sessionRootCwd,
+						activeTeamState.teamName,
+					);
 					if (activeTeam?.members[record.name]) {
 						inferredTeamName = activeTeamState.teamName;
 					}
 				}
 				if (!inferredTeamName) {
 					try {
-						const entries = await fs.promises.readdir(getTeamsDir(sessionRootCwd));
+						const entries = await fs.promises.readdir(
+							getTeamsDir(sessionRootCwd),
+						);
 						for (const entry of entries) {
-							if (!entry.endsWith('.json')) continue;
+							if (!entry.endsWith(".json")) continue;
 							const teamName = entry.slice(0, -5);
 							const team = await loadTeamRecord(sessionRootCwd, teamName);
 							if (team?.members[record.name]) {
@@ -2439,9 +3717,17 @@ export default function (pi: ExtensionAPI) {
 						// Ignore missing team directory during notification formatting.
 					}
 				}
-				if (inferredTeamName && record.kind === "teammate" && (record.status === "failed" || record.status === "interrupted")) {
+				if (
+					inferredTeamName &&
+					record.kind === "teammate" &&
+					(record.status === "failed" || record.status === "interrupted")
+				) {
 					try {
-						await removeTeammateMember(sessionRootCwd, inferredTeamName, record.name);
+						await removeTeammateMember(
+							sessionRootCwd,
+							inferredTeamName,
+							record.name,
+						);
 					} catch {
 						// Keep runtime termination notifications best-effort if task reclamation fails.
 					}
@@ -2454,7 +3740,12 @@ export default function (pi: ExtensionAPI) {
 					...(inferredTeamName ? { teamName: inferredTeamName } : {}),
 					model: record.model,
 					description: record.lastDescription,
-					status: record.status === "completed" ? "completed" : record.status === "failed" ? "failed" : "interrupted",
+					status:
+						record.status === "completed"
+							? "completed"
+							: record.status === "failed"
+								? "failed"
+								: "interrupted",
 					sessionFile: record.sessionFile,
 					startedAt: record.lastStartedAt,
 					completedAt: record.lastCompletedAt,
@@ -2480,12 +3771,24 @@ export default function (pi: ExtensionAPI) {
 		get(name, options) {
 			const live = runtimeManager?.get(name, options);
 			if (live) return live;
-			const detached = getDetachedManagedRuntimeTask(name, options?.kind ?? "subagent", options?.teamName);
+			const detached = getDetachedManagedRuntimeTask(
+				name,
+				options?.kind ?? "subagent",
+				options?.teamName,
+			);
 			return detached ? toDetachedManagedRecord(detached) : undefined;
 		},
 		list() {
 			const liveRecords = runtimeManager?.list() ?? [];
-			const liveKeys = new Set(liveRecords.map((record) => getManagedTaskIdForNamedRuntime(record.name, record.kind ?? "subagent", record.teamName)));
+			const liveKeys = new Set(
+				liveRecords.map((record) =>
+					getManagedTaskIdForNamedRuntime(
+						record.name,
+						record.kind ?? "subagent",
+						record.teamName,
+					),
+				),
+			);
 			const detachedRecords = (managedTaskRegistry?.list() ?? [])
 				.filter((task) => task.detached === true)
 				.filter((task) => !liveKeys.has(task.taskId))
@@ -2494,12 +3797,30 @@ export default function (pi: ExtensionAPI) {
 			return [...liveRecords, ...detachedRecords];
 		},
 		async abort(name, options) {
-			return stopManagedRuntime(name, { kind: options?.kind, teamName: options?.teamName });
+			return stopManagedRuntime(name, {
+				kind: options?.kind ?? "subagent",
+				teamName: options?.teamName,
+			});
 		},
 		async launchBackground(input) {
-			if (supportsDetachedBackgroundRun({ kind: input.kind, teamName: input.teamName })) {
+			if (
+				supportsDetachedBackgroundRun({
+					kind: input.kind,
+					teamName: input.teamName,
+				})
+			) {
+				await ensureAgentIsolationReady({
+					stateCwd: input.sessionCwd ?? input.defaultCwd,
+					baseCwd: input.sessionCwd ?? input.defaultCwd,
+					agent: input.agent,
+					logicalName: input.name,
+					kind: input.kind ?? "subagent",
+					teamName: input.teamName,
+				});
 				const launched = await launchDetachedBackgroundRun({
-					cwd: input.defaultCwd,
+					stateCwd: input.sessionCwd ?? input.defaultCwd,
+					runtimeCwd:
+						input.persisted?.cwd ?? input.requestedCwd ?? input.defaultCwd,
 					getSessionDir: getNamedAgentSessionDir,
 					name: input.name,
 					kind: input.kind,
@@ -2507,18 +3828,33 @@ export default function (pi: ExtensionAPI) {
 					agent: input.agent,
 					task: input.task,
 					description: input.description,
-					currentModel: input.currentModel ? `${input.currentModel.provider}/${input.currentModel.id}` : undefined,
+					currentModel: input.currentModel
+						? `${input.currentModel.provider}/${input.currentModel.id}`
+						: undefined,
 					modelOverride: input.modelOverride,
 					permissions: {
 						...(input.allowedTools ? { allowedTools: input.allowedTools } : {}),
-						...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
-						...(input.allowedDirectories ? { allowedDirectories: input.allowedDirectories } : {}),
-						...(input.allowedSkills ? { allowedSkills: input.allowedSkills } : {}),
-						...(input.disallowedSkills ? { disallowedSkills: input.disallowedSkills } : {}),
-						...(input.agent.permissionMode ? { permissionMode: input.agent.permissionMode } : {}),
+						...(input.disallowedTools
+							? { disallowedTools: input.disallowedTools }
+							: {}),
+						...(input.allowedDirectories
+							? { allowedDirectories: input.allowedDirectories }
+							: {}),
+						...(input.allowedSkills
+							? { allowedSkills: input.allowedSkills }
+							: {}),
+						...(input.disallowedSkills
+							? { disallowedSkills: input.disallowedSkills }
+							: {}),
+						...(input.agent.permissionMode
+							? { permissionMode: input.agent.permissionMode }
+							: {}),
 					},
 					persisted: input.persisted,
-					managedPlanModeInitialReason: input.agent.permissionMode === "plan" ? input.description : undefined,
+					managedPlanModeInitialReason:
+						input.agent.permissionMode === "plan"
+							? input.description
+							: undefined,
 					managedTaskRegistry,
 				});
 				await persistDetachedLaunchRecord(launched);
@@ -2530,17 +3866,24 @@ export default function (pi: ExtensionAPI) {
 			return runtimeManager.launchBackground(input);
 		},
 		async sendMessage(input) {
-			const live = runtimeManager?.get(input.name, { kind: input.kind, teamName: input.teamName });
+			const live = runtimeManager?.get(input.name, {
+				kind: input.kind,
+				teamName: input.teamName,
+			});
 			if (live && runtimeManager) {
 				return runtimeManager.sendMessage(input);
 			}
-			const detached = getDetachedManagedRuntimeTask(input.name, input.kind ?? "subagent", input.teamName);
+			const detached = getDetachedManagedRuntimeTask(
+				input.name,
+				input.kind ?? "subagent",
+				input.teamName,
+			);
 			if (!detached) {
 				throw new Error(`Managed runtime \"${input.name}\" is not active.`);
 			}
 			if (detached.status === "running") {
 				const pendingCount = await queueDetachedBackgroundMessage({
-					cwd: input.defaultCwd,
+					cwd: input.sessionCwd ?? input.defaultCwd,
 					name: input.name,
 					kind: input.kind,
 					teamName: input.teamName,
@@ -2553,8 +3896,18 @@ export default function (pi: ExtensionAPI) {
 					pendingCount,
 				};
 			}
+			await ensureAgentIsolationReady({
+				stateCwd: input.sessionCwd ?? input.defaultCwd,
+				baseCwd: input.sessionCwd ?? input.defaultCwd,
+				agent: input.agent,
+				logicalName: input.name,
+				kind: input.kind ?? "subagent",
+				teamName: input.teamName,
+			});
 			const relaunched = await launchDetachedBackgroundRun({
-				cwd: input.defaultCwd,
+				stateCwd: input.sessionCwd ?? input.defaultCwd,
+				runtimeCwd:
+					input.persisted?.cwd ?? input.requestedCwd ?? input.defaultCwd,
 				getSessionDir: getNamedAgentSessionDir,
 				name: input.name,
 				kind: input.kind,
@@ -2562,18 +3915,31 @@ export default function (pi: ExtensionAPI) {
 				agent: input.agent,
 				task: input.message,
 				description: input.summary ?? `Follow-up for ${input.name}`,
-				currentModel: input.currentModel ? `${input.currentModel.provider}/${input.currentModel.id}` : undefined,
+				currentModel: input.currentModel
+					? `${input.currentModel.provider}/${input.currentModel.id}`
+					: undefined,
 				modelOverride: input.modelOverride,
 				permissions: {
 					...(input.allowedTools ? { allowedTools: input.allowedTools } : {}),
-					...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
-					...(input.allowedDirectories ? { allowedDirectories: input.allowedDirectories } : {}),
-					...(input.allowedSkills ? { allowedSkills: input.allowedSkills } : {}),
-					...(input.disallowedSkills ? { disallowedSkills: input.disallowedSkills } : {}),
-					...(input.agent.permissionMode ? { permissionMode: input.agent.permissionMode } : {}),
+					...(input.disallowedTools
+						? { disallowedTools: input.disallowedTools }
+						: {}),
+					...(input.allowedDirectories
+						? { allowedDirectories: input.allowedDirectories }
+						: {}),
+					...(input.allowedSkills
+						? { allowedSkills: input.allowedSkills }
+						: {}),
+					...(input.disallowedSkills
+						? { disallowedSkills: input.disallowedSkills }
+						: {}),
+					...(input.agent.permissionMode
+						? { permissionMode: input.agent.permissionMode }
+						: {}),
 				},
 				persisted: input.persisted,
-				managedPlanModeInitialReason: input.agent.permissionMode === "plan" ? input.summary : undefined,
+				managedPlanModeInitialReason:
+					input.agent.permissionMode === "plan" ? input.summary : undefined,
 				managedTaskRegistry,
 			});
 			await persistDetachedLaunchRecord(relaunched);
@@ -2606,24 +3972,39 @@ export default function (pi: ExtensionAPI) {
 		promptPaths: getBundledPromptPaths(),
 	}));
 
-	pi.registerMessageRenderer(BACKGROUND_AGENT_MESSAGE, (message, options, theme) =>
-		renderBackgroundNotification(message, options, theme),
+	pi.registerMessageRenderer(
+		BACKGROUND_AGENT_MESSAGE,
+		(message, options, theme) =>
+			renderBackgroundNotification(message, options, theme),
 	);
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionRootCwd = ctx.cwd;
 		managedTaskRegistry = new ManagedTaskRegistry(ctx.cwd);
 		await managedTaskRegistry.load();
-		await managedTaskRegistry.markRunningTasksInterrupted(INTERRUPTED_BACKGROUND_MESSAGE, {
-			keepRunning: (task) => task.detached === true,
-		});
+		await managedTaskRegistry.markRunningTasksInterrupted(
+			INTERRUPTED_BACKGROUND_MESSAGE,
+			{
+				keepRunning: (task) => task.detached === true,
+			},
+		);
 		setSharedManagedTaskRegistry(managedTaskRegistry);
 		const sessionState = restoreNamedAgentState(ctx);
 		const diskState = await loadNamedAgentStateFromDiskFile(ctx.cwd);
-		namedAgentState = Object.keys(diskState.agents).length > 0 ? diskState : sessionState;
-		namedAgentState = markNamedAgentStateInterrupted(namedAgentState, INTERRUPTED_BACKGROUND_MESSAGE, {
-		keepRunning: (record) => isDetachedManagedRuntimeRunning(record.name, record.kind ?? "subagent", record.teamName),
-		});
+		namedAgentState =
+			Object.keys(diskState.agents).length > 0 ? diskState : sessionState;
+		namedAgentState = markNamedAgentStateInterrupted(
+			namedAgentState,
+			INTERRUPTED_BACKGROUND_MESSAGE,
+			{
+				keepRunning: (record) =>
+					isDetachedManagedRuntimeRunning(
+						record.name,
+						record.kind ?? "subagent",
+						record.teamName,
+					),
+			},
+		);
 		await prunePersistedTeammates(ctx.cwd);
 
 		const sessionTeamState = restoreActiveTeamState(ctx);
@@ -2652,7 +4033,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "TeamCreate",
 		label: "TeamCreate",
-		description: "Create or activate a local Claude-style team context for teammate spawning and message routing.",
+		description:
+			"Create or activate a local Claude-style team context for teammate spawning and message routing.",
 		promptSnippet: "Create or activate a local Claude-style team context.",
 		promptGuidelines: [
 			"Use TeamCreate before spawning teammates with Agent(team_name + name).",
@@ -2673,8 +4055,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "TeamDelete",
 		label: "TeamDelete",
-		description: "Delete the active local Claude-style team after all running teammates have stopped.",
-		promptSnippet: "Delete the active local Claude-style team and its shared task list.",
+		description:
+			"Delete the active local Claude-style team after all running teammates have stopped.",
+		promptSnippet:
+			"Delete the active local Claude-style team and its shared task list.",
 		promptGuidelines: [
 			"Use TeamDelete when a local swarm is finished and you want to clean up its team/task state.",
 			"Do not call TeamDelete while teammates are still running; stop them first.",
@@ -2695,13 +4079,14 @@ export default function (pi: ExtensionAPI) {
 		name: "Agent",
 		label: "Agent",
 		description: "Launch a Claude-style specialized agent for delegated work.",
-		promptSnippet: "Launch a Claude-style specialized agent for delegated work.",
+		promptSnippet:
+			"Launch a Claude-style specialized agent for delegated work.",
 		promptGuidelines: [
 			"Use Agent with subagent_type=Explore for read-only codebase recon.",
 			"Use Agent with subagent_type=Plan for read-only implementation planning.",
 			"If subagent_type is omitted, the package defaults to general-purpose.",
 			"Use allowed_tools/disallowed_tools to shape which tools the child runtime may call.",
-			"Use allowed_directories to confine file-based tools to specific directories. bash is blocked when directory restrictions are active.",
+			"Use allowed_directories to confine file-based tools to specific directories. bash is currently still allowed, so shell commands are not path-confined yet.",
 			"Use allowed_skills/disallowed_skills to control which skills are loaded into the child runtime.",
 			"Use name for persistent continuation across Agent calls.",
 			"run_in_background is supported for named agents and agents whose frontmatter sets background: true.",
@@ -2710,7 +4095,12 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: AgentParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return executeClaudeAgentTool(params as ClaudeAgentParams, signal, onUpdate, ctx);
+			return executeClaudeAgentTool(
+				params as ClaudeAgentParams,
+				signal,
+				onUpdate,
+				ctx,
+			);
 		},
 		renderCall(args, theme) {
 			return renderAgentCall(args as ClaudeAgentParams, theme);
@@ -2723,8 +4113,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "SendMessage",
 		label: "SendMessage",
-		description: "Send a follow-up message to a named managed agent or local teammate. Running agents queue the message; idle agents resume in the background. Structured protocol payloads such as shutdown_request are also supported.",
-		promptSnippet: "Send a follow-up message or structured protocol payload to a named managed agent.",
+		description:
+			"Send a follow-up message to a named managed agent or local teammate. Running agents queue the message; idle agents resume in the background. Structured protocol payloads such as shutdown_request are also supported.",
+		promptSnippet:
+			"Send a follow-up message or structured protocol payload to a named managed agent.",
 		promptGuidelines: [
 			"Use SendMessage with named agents previously launched through Agent.",
 			"Use SendMessage with teammate names after creating a team and spawning teammates.",
@@ -2750,7 +4142,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized Claude-style subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			'Bundled package agents are available out of the box; user agents from ~/.pi/agent/agents are also loaded by default.',
+			"Bundled package agents are available out of the box; user agents from ~/.pi/agent/agents are also loaded by default.",
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 		].join(" "),
 		parameters: SubagentParams,
@@ -2776,7 +4168,8 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+				const available =
+					agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
 					content: [
 						{
@@ -2788,10 +4181,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+			if (
+				(agentScope === "project" || agentScope === "both") &&
+				confirmProjectAgents &&
+				ctx.hasUI
+			) {
 				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+				if (params.chain)
+					for (const step of params.chain) requestedAgentNames.add(step.agent);
+				if (params.tasks)
+					for (const t of params.tasks) requestedAgentNames.add(t.agent);
 				if (params.agent) requestedAgentNames.add(params.agent);
 
 				const projectAgentsRequested = Array.from(requestedAgentNames)
@@ -2807,8 +4206,15 @@ export default function (pi: ExtensionAPI) {
 					);
 					if (!ok)
 						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							content: [
+								{
+									type: "text",
+									text: "Canceled: project-local agents not approved.",
+								},
+							],
+							details: makeDetails(
+								hasChain ? "chain" : hasTasks ? "parallel" : "single",
+							)([]),
 						};
 				}
 			}
@@ -2819,7 +4225,10 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const taskWithContext = step.task.replace(
+						/\{previous\}/g,
+						previousOutput,
+					);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -2841,7 +4250,7 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						step.agent,
 						taskWithContext,
-					undefined,
+						undefined,
 						step.cwd,
 						i + 1,
 						signal,
@@ -2851,12 +4260,22 @@ export default function (pi: ExtensionAPI) {
 					results.push(result);
 
 					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+						result.exitCode !== 0 ||
+						result.stopReason === "error" ||
+						result.stopReason === "aborted";
 					if (isError) {
 						const errorMsg =
-							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+							result.errorMessage ||
+							result.stderr ||
+							getFinalOutput(result.messages) ||
+							"(no output)";
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+							content: [
+								{
+									type: "text",
+									text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+								},
+							],
 							details: makeDetails("chain")(results),
 							isError: true,
 						};
@@ -2864,7 +4283,14 @@ export default function (pi: ExtensionAPI) {
 					previousOutput = getFinalOutput(result.messages);
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text:
+								getFinalOutput(results[results.length - 1].messages) ||
+								"(no output)",
+						},
+					],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -2893,7 +4319,15 @@ export default function (pi: ExtensionAPI) {
 						exitCode: -1, // -1 = still running
 						messages: [],
 						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							cost: 0,
+							contextTokens: 0,
+							turns: 0,
+						},
 					};
 				}
 
@@ -2903,41 +4337,49 @@ export default function (pi: ExtensionAPI) {
 						const done = allResults.filter((r) => r.exitCode !== -1).length;
 						onUpdate({
 							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
+								{
+									type: "text",
+									text: `Parallel: ${done}/${allResults.length} done, ${running} running...`,
+								},
 							],
 							details: makeDetails("parallel")([...allResults]),
 						});
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-					undefined,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
+				const results = await mapWithConcurrencyLimit(
+					params.tasks,
+					MAX_CONCURRENCY,
+					async (t, index) => {
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							undefined,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+						);
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					},
+				);
 
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
 					const output = getFinalOutput(r.messages);
-					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
+					const preview =
+						output.slice(0, 100) + (output.length > 100 ? "..." : "");
 					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
 				});
 				return {
@@ -2964,25 +4406,47 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 				);
-				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+				const isError =
+					result.exitCode !== 0 ||
+					result.stopReason === "error" ||
+					result.stopReason === "aborted";
 				if (isError) {
 					const errorMsg =
-						result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+						result.errorMessage ||
+						result.stderr ||
+						getFinalOutput(result.messages) ||
+						"(no output)";
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						content: [
+							{
+								type: "text",
+								text: `Agent ${result.stopReason || "failed"}: ${errorMsg}`,
+							},
+						],
 						details: makeDetails("single")([result]),
 						isError: true,
 					};
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text: getFinalOutput(result.messages) || "(no output)",
+						},
+					],
 					details: makeDetails("single")([result]),
 				};
 			}
 
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const available =
+				agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+				content: [
+					{
+						type: "text",
+						text: `Invalid parameters. Available agents: ${available}`,
+					},
+				],
 				details: makeDetails("single")([]),
 			};
 		},
@@ -2998,7 +4462,8 @@ export default function (pi: ExtensionAPI) {
 					const step = args.chain[i];
 					// Clean up {previous} placeholder for display
 					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+					const preview =
+						cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
@@ -3006,7 +4471,8 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("accent", step.agent) +
 						theme.fg("dim", ` ${preview}`);
 				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
+				if (args.chain.length > 3)
+					text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
 				return new Text(text, 0, 0);
 			}
 			if (args.tasks && args.tasks.length > 0) {
@@ -3015,14 +4481,20 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
 					theme.fg("muted", ` [${scope}]`);
 				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
+					const preview =
+						t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
 				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
+				if (args.tasks.length > 3)
+					text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
 			}
 			const agentName = args.agent || "...";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+			const preview = args.task
+				? args.task.length > 60
+					? `${args.task.slice(0, 60)}...`
+					: args.task
+				: "...";
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
@@ -3035,19 +4507,27 @@ export default function (pi: ExtensionAPI) {
 			const details = result.details as SubagentDetails | undefined;
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+				return new Text(
+					text?.type === "text" ? text.text : "(no output)",
+					0,
+					0,
+				);
 			}
 
 			const mdTheme = getMarkdownTheme();
 
 			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
 				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
+				const skipped =
+					limit && items.length > limit ? items.length - limit : 0;
 				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
+				if (skipped > 0)
+					text += theme.fg("muted", `... ${skipped} earlier items\n`);
 				for (const item of toShow) {
 					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
+						const preview = expanded
+							? item.text
+							: item.text.split("\n").slice(0, 3).join("\n");
 						text += `${theme.fg("toolOutput", preview)}\n`;
 					} else {
 						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
@@ -3058,31 +4538,48 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
-				const isError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const isError =
+					r.exitCode !== 0 ||
+					r.stopReason === "error" ||
+					r.stopReason === "aborted";
+				const icon = isError
+					? theme.fg("error", "✗")
+					: theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
 
 				if (expanded) {
 					const container = new Container();
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					if (isError && r.stopReason)
+						header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+						container.addChild(
+							new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0),
+						);
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+					container.addChild(
+						new Text(theme.fg("muted", "─── Output ───"), 0, 0),
+					);
 					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+						container.addChild(
+							new Text(theme.fg("muted", "(no output)"), 0, 0),
+						);
 					} else {
 						for (const item of displayItems) {
 							if (item.type === "toolCall")
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(
+												item.name,
+												item.args,
+												theme.fg.bind(theme),
+											),
 										0,
 										0,
 									),
@@ -3090,7 +4587,9 @@ export default function (pi: ExtensionAPI) {
 						}
 						if (finalOutput) {
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							container.addChild(
+								new Markdown(finalOutput.trim(), 0, 0, mdTheme),
+							);
 						}
 					}
 					const usageStr = formatUsageStats(r.usage, r.model);
@@ -3102,12 +4601,16 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+				if (isError && r.stopReason)
+					text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				if (isError && r.errorMessage)
+					text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
+				else if (displayItems.length === 0)
+					text += `\n${theme.fg("muted", "(no output)")}`;
 				else {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+					if (displayItems.length > COLLAPSED_ITEM_COUNT)
+						text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
@@ -3115,7 +4618,14 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+				const total = {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					cost: 0,
+					turns: 0,
+				};
 				for (const r of results) {
 					total.input += r.usage.input;
 					total.output += r.usage.output;
@@ -3128,8 +4638,13 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				const successCount = details.results.filter(
+					(r) => r.exitCode === 0,
+				).length;
+				const icon =
+					successCount === details.results.length
+						? theme.fg("success", "✓")
+						: theme.fg("error", "✗");
 
 				if (expanded) {
 					const container = new Container();
@@ -3138,14 +4653,20 @@ export default function (pi: ExtensionAPI) {
 							icon +
 								" " +
 								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
+								theme.fg(
+									"accent",
+									`${successCount}/${details.results.length} steps`,
+								),
 							0,
 							0,
 						),
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon =
+							r.exitCode === 0
+								? theme.fg("success", "✓")
+								: theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -3157,14 +4678,25 @@ export default function (pi: ExtensionAPI) {
 								0,
 							),
 						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						container.addChild(
+							new Text(
+								theme.fg("muted", "Task: ") + theme.fg("dim", r.task),
+								0,
+								0,
+							),
+						);
 
 						// Show tool calls
 						for (const item of displayItems) {
 							if (item.type === "toolCall") {
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(
+												item.name,
+												item.args,
+												theme.fg.bind(theme),
+											),
 										0,
 										0,
 									),
@@ -3175,17 +4707,22 @@ export default function (pi: ExtensionAPI) {
 						// Show final output as markdown
 						if (finalOutput) {
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							container.addChild(
+								new Markdown(finalOutput.trim(), 0, 0, mdTheme),
+							);
 						}
 
 						const stepUsage = formatUsageStats(r.usage, r.model);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
+						if (stepUsage)
+							container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
 
 					const usageStr = formatUsageStats(aggregateUsage(details.results));
 					if (usageStr) {
 						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+						container.addChild(
+							new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0),
+						);
 					}
 					return container;
 				}
@@ -3197,10 +4734,14 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon =
+						r.exitCode === 0
+							? theme.fg("success", "✓")
+							: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					if (displayItems.length === 0)
+						text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
@@ -3211,7 +4752,9 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "parallel") {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter(
+					(r) => r.exitCode === 0,
+				).length;
 				const failCount = details.results.filter((r) => r.exitCode > 0).length;
 				const isRunning = running > 0;
 				const icon = isRunning
@@ -3234,22 +4777,40 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon =
+							r.exitCode === 0
+								? theme.fg("success", "✓")
+								: theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
 						container.addChild(new Spacer(1));
 						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+							new Text(
+								`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`,
+								0,
+								0,
+							),
 						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						container.addChild(
+							new Text(
+								theme.fg("muted", "Task: ") + theme.fg("dim", r.task),
+								0,
+								0,
+							),
+						);
 
 						// Show tool calls
 						for (const item of displayItems) {
 							if (item.type === "toolCall") {
 								container.addChild(
 									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+										theme.fg("muted", "→ ") +
+											formatToolCall(
+												item.name,
+												item.args,
+												theme.fg.bind(theme),
+											),
 										0,
 										0,
 									),
@@ -3260,17 +4821,22 @@ export default function (pi: ExtensionAPI) {
 						// Show final output as markdown
 						if (finalOutput) {
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+							container.addChild(
+								new Markdown(finalOutput.trim(), 0, 0, mdTheme),
+							);
 						}
 
 						const taskUsage = formatUsageStats(r.usage, r.model);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
+						if (taskUsage)
+							container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
 
 					const usageStr = formatUsageStats(aggregateUsage(details.results));
 					if (usageStr) {
 						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+						container.addChild(
+							new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0),
+						);
 					}
 					return container;
 				}

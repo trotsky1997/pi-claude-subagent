@@ -124,6 +124,7 @@ export class AgentRuntimeManager {
     name: string;
     agent: AgentConfig;
     defaultCwd: string;
+    sessionCwd?: string;
     requestedCwd?: string;
     modelRegistry: ModelRegistry;
     currentModel: Model<any> | undefined;
@@ -150,6 +151,7 @@ export class AgentRuntimeManager {
     task: string;
     description?: string;
     defaultCwd: string;
+    sessionCwd?: string;
     requestedCwd?: string;
     modelRegistry: ModelRegistry;
     currentModel: Model<any> | undefined;
@@ -183,6 +185,7 @@ export class AgentRuntimeManager {
     task: string;
     description?: string;
     defaultCwd: string;
+    sessionCwd?: string;
     requestedCwd?: string;
     modelRegistry: ModelRegistry;
     currentModel: Model<any> | undefined;
@@ -217,6 +220,7 @@ export class AgentRuntimeManager {
     message: string;
     summary?: string;
     defaultCwd: string;
+    sessionCwd?: string;
     requestedCwd?: string;
     modelRegistry: ModelRegistry;
     currentModel: Model<any> | undefined;
@@ -366,12 +370,14 @@ export class AgentRuntimeManager {
     name: string;
     agent: AgentConfig;
     defaultCwd: string;
+    sessionCwd?: string;
     requestedCwd?: string;
     modelRegistry: ModelRegistry;
     currentModel: Model<any> | undefined;
     modelOverride?: string;
     persisted?: NamedAgentRecord;
   }): Promise<ManagedHandle> {
+    const sessionCwd = input.sessionCwd ?? input.defaultCwd;
     const executionCwd = input.persisted?.cwd ?? input.requestedCwd ?? input.defaultCwd;
     const runtimeKey = makeRuntimeKey({ name: input.name, kind: input.kind, teamName: input.teamName });
     const existing = this.handles.get(runtimeKey);
@@ -391,10 +397,10 @@ export class AgentRuntimeManager {
       input.persisted?.sessionFile && fs.existsSync(input.persisted.sessionFile)
         ? SessionManager.open(
             input.persisted.sessionFile,
-            this.options.getSessionDir(executionCwd),
+            this.options.getSessionDir(sessionCwd),
             executionCwd,
           )
-        : SessionManager.create(executionCwd, this.options.getSessionDir(executionCwd));
+        : SessionManager.create(executionCwd, this.options.getSessionDir(sessionCwd));
 
     const runtimeProfile = ManagedRuntimeProfile.fromAgent(input.agent, {
       ...(input.allowedTools ?? input.persisted?.allowedTools ? { allowedTools: input.allowedTools ?? input.persisted?.allowedTools } : {}),
